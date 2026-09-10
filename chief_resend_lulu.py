@@ -1,17 +1,20 @@
-"""Retry the latest LULU swing resend until a valid contract is available."""
+"""One-time resend of the latest LULU swing signal.
+
+Chief attempts to include a live swing contract. If no qualifying contract is
+available, the confirmed stock signal is still sent with a clear contract note.
+"""
 import os
 import threading
-import time
 from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
 load_dotenv('.env')
-MARKER = Path(__file__).with_name('.chief_lulu_resend_contract_v1.sent')
-RETRY_SECONDS = 60
+MARKER = Path(__file__).with_name('.chief_lulu_resend_contract_v2.sent')
 
 
 def _build_message(options):
+    option_text = options.get('text') or '⚠️ No qualifying options contract available right now.'
     return (
         "✅ CHIEF CONFIRMED PUT | LULU | SWING\n"
         "Score: 8.0/10\n"
@@ -26,57 +29,54 @@ def _build_message(options):
         "Confirmation: PRICE ACTION CONFIRMED | Score ≥ 8.0, Directional candle, Trigger/BOS, Breakout hold, Rejection\n"
         "News: MIXED/NEUTRAL headline tone | Moomoo News 9/10 | Morgan Stanley Maintains Lululemon Athletica With Sell Rating, Maintains Target Price $83\n"
         "Why: HTF trend aligned, Double Top, 20/50 EMA structure, bearish momentum, 3m EMA8/VWAP aligned, spread 0.02%, Swing trend structure\n\n"
-        f"{options['text']}\n\n"
+        f"{option_text}\n\n"
         "Status: ✅ CONFIRMED — PRICE ACTION VALIDATED"
     )
 
 
-def _retry_loop():
+def _send_once():
     if MARKER.exists():
         return
 
     webhook = os.getenv('DISCORD_WEBHOOK_URL', '')
     if not webhook:
-        print('LULU resend waiting: DISCORD_WEBHOOK_URL is not configured.', flush=True)
+        print('LULU resend skipped: DISCORD_WEBHOOK_URL is not configured.', flush=True)
         return
 
-    from moomoo import OpenQuoteContext
-    from chief_options import recommend_options
+    options = {'ok': False, 'text': '⚠️ No qualifying swing contract available right now.', 'picks': []}
+    try:
+        from moomoo import OpenQuoteContext
+        from chief_options import recommend_options
 
-    while not MARKER.exists():
+        ctx = OpenQuoteContext(
+            host=os.getenv('MOOMOO_HOST', '127.0.0.1'),
+            port=int(os.getenv('MOOMOO_PORT', '11111')),
+        )
         try:
-            ctx = OpenQuoteContext(
-                host=os.getenv('MOOMOO_HOST', '127.0.0.1'),
-                port=int(os.getenv('MOOMOO_PORT', '11111')),
-            )
-            try:
-                options = recommend_options(ctx, 'LULU', 'PUT', trade_type='SWING')
-            finally:
-                ctx.close()
+            options = recommend_options(ctx, 'LULU', 'PUT', trade_type='SWING')
+        finally:
+            ctx.close()
+    except Exception as exc:
+        options = {
+            'ok': False,
+            'text': f'⚠️ Contract unavailable at signal time: {exc}',
+            'picks': [],
+        }
 
-            if not options.get('ok'):
-                print(
-                    f"LULU resend retrying in {RETRY_SECONDS}s: {options.get('text', 'option scan unavailable')}",
-                    flush=True,
-                )
-                time.sleep(RETRY_SECONDS)
-                continue
-
-            msg = _build_message(options)
-            r = requests.post(webhook, json={'content': msg}, timeout=20)
-            r.raise_for_status()
-            MARKER.write_text('sent\n', encoding='utf-8')
-            print('One-time LULU swing signal resent with recommended contract.', flush=True)
-            return
-        except Exception as exc:
-            print(f'LULU resend retry warning: {exc}; retrying in {RETRY_SECONDS}s', flush=True)
-            time.sleep(RETRY_SECONDS)
+    msg = _build_message(options)
+    r = requests.post(webhook, json={'content': msg}, timeout=20)
+    r.raise_for_status()
+    MARKER.write_text('sent\n', encoding='utf-8')
+    if options.get('ok'):
+        print('One-time LULU swing signal resent with recommended contract.', flush=True)
+    else:
+        print('One-time LULU swing signal resent without contract.', flush=True)
 
 
-def start_retry():
+def start_send():
     if MARKER.exists():
         return
-    threading.Thread(target=_retry_loop, daemon=True, name='chief-lulu-resend-retry').start()
+    threading.Thread(target=_send_once, daemon=True, name='chief-lulu-resend-v2').start()
 
 
-start_retry()
+start_send()
