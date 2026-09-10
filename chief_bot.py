@@ -21,7 +21,8 @@ DAY_TRADING = os.getenv('DAY_TRADING', 'true').lower() in ('1', 'true', 'yes', '
 SWING_TRADING = os.getenv('SWING_TRADING', 'true').lower() in ('1', 'true', 'yes', 'on')
 
 WHOLE_MARKET = os.getenv('WHOLE_MARKET', 'true').lower() in ('1', 'true', 'yes', 'on')
-DEEP_CANDIDATES = int(os.getenv('DEEP_CANDIDATES', '24'))
+# With 1m/3m/5m/15m/60m/Daily subscriptions, cap deep scan at 16 names to stay under a 100-symbol subscription quota.
+DEEP_CANDIDATES = min(int(os.getenv('DEEP_CANDIDATES', '24')), 16 if DAY_TRADING else 24)
 UNIVERSE_REFRESH_SECONDS = int(os.getenv('UNIVERSE_REFRESH_SECONDS', '900'))
 MIN_PRICE = float(os.getenv('MIN_PRICE', '5'))
 MAX_PRICE = float(os.getenv('MAX_PRICE', '1000'))
@@ -125,7 +126,6 @@ def ema8_vwap_3m(df):
         return {'bull_cross': False, 'bear_cross': False, 'bull_aligned': False, 'bear_aligned': False,
                 'ema8': float(e8.iloc[-1]), 'vwap': 0.0, 'text': '3m EMA8/VWAP unavailable'}
 
-    # Fresh cross means it happened on one of the last three completed 3m bars.
     bull_series = (e8 > vwap) & (e8.shift(1) <= vwap.shift(1))
     bear_series = (e8 < vwap) & (e8.shift(1) >= vwap.shift(1))
     bull_cross = bool(bull_series.tail(3).fillna(False).any())
@@ -182,7 +182,6 @@ def score_setup(side, entry_m, higher_m, daily, patterns, momentum, micro3, spre
         score += mom_points
         reasons.append(mom_reason)
 
-    # 3-minute EMA8/VWAP is a strong timing confirmation for day trades and useful context for swings.
     cross_ok = micro3['bull_cross'] if side == 'CALL' else micro3['bear_cross']
     micro_aligned = micro3['bull_aligned'] if side == 'CALL' else micro3['bear_aligned']
     if cross_ok:
@@ -202,14 +201,15 @@ def score_setup(side, entry_m, higher_m, daily, patterns, momentum, micro3, spre
     return min(round(score, 1), 10.0), reasons, (matching[0] if matching else None)
 
 
-def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, micro3, news, options, confirmation, trade_type):
+def format_alert(ticker, side, score, status, price, pat, pattern_tf, reasons, spread_pct, momentum, micro3, news, options, confirmation, trade_type):
     atr_note = 'Pattern-based invalidation' if pat and pat.invalidation else 'Use confirmed structure invalidation'
     trigger = f"{pat.trigger:.2f}" if pat and pat.trigger else f"{price:.2f} confirmation"
     invalid = f"{pat.invalidation:.2f}" if pat and pat.invalidation else atr_note
     icon = '✅' if status == 'CONFIRMED' else '⏳'
     status_text = 'CONFIRMED — PRICE ACTION VALIDATED' if status == 'CONFIRMED' else 'WAITING FOR PRICE-ACTION CONFIRMATION...'
     options_text = options['text'] if status == 'CONFIRMED' else '⏳ Options: Chief will select contracts after price action confirms.'
-    timeframe_text = '15m execution / 3m timing / 1H + Daily bias' if trade_type == 'DAY TRADE' else '1H execution / Daily swing bias / 3m timing context'
+    timeframe_text = '1m + 5m patterns / 3m EMA8-VWAP timing / 15m execution / 1H + Daily bias' if trade_type == 'DAY TRADE' else '1H execution / Daily swing bias / 3m timing context'
+    pattern_text = f"{pat.name} ({pattern_tf})" if pat else 'No A+ pattern yet'
 
     return (
         f"{icon} CHIEF {status} {side} | {ticker} | {trade_type}\n"
@@ -218,7 +218,7 @@ def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, m
         f"Momentum: {momentum['text']}\n"
         f"3m Timing: {micro3['text']}\n"
         f"Spread: {spread_pct:.2f}%\n"
-        f"Pattern: {pat.name if pat else 'No A+ pattern yet'}\n"
+        f"Pattern: {pattern_text}\n"
         f"Trigger: {trigger}\nInvalidation: {invalid}\n"
         f"Confirmation: {confirmation['text']}\n"
         f"News: {news['text']}\n"
@@ -336,7 +336,7 @@ def rank_market_candidates(snapshot):
 
 def build_deep_scan_list(ctx):
     if not WHOLE_MARKET:
-        return [f'US.{x}' for x in CORE_WATCHLIST]
+        return [f'US.{x}' for x in CORE_WATCHLIST[:DEEP_CANDIDATES]]
     universe = get_us_stock_universe(ctx)
     print(f'CHIEF stage 1: scanning {len(universe)} US symbols...', flush=True)
     snap = get_snapshots(ctx, universe)
@@ -369,7 +369,9 @@ def snapshot_for_code(ctx, code):
 def get_bars(ctx, code, ktype, count=300):
     from moomoo import RET_OK, SubType, KLType
     subtype = {
+        KLType.K_1M: SubType.K_1M,
         KLType.K_3M: SubType.K_3M,
+        KLType.K_5M: SubType.K_5M,
         KLType.K_15M: SubType.K_15M,
         KLType.K_60M: SubType.K_60M,
         KLType.K_DAY: SubType.K_DAY,
@@ -387,21 +389,39 @@ def release_removed_candidates(ctx, removed):
     if not removed:
         return
     from moomoo import RET_OK, SubType
-    subtypes = [SubType.K_3M, SubType.K_15M, SubType.K_60M, SubType.K_DAY]
+    subtypes = [SubType.K_1M, SubType.K_3M, SubType.K_5M, SubType.K_15M, SubType.K_60M, SubType.K_DAY]
     for code in removed:
         ret, err = ctx.unsubscribe([code], subtypes)
         if ret != RET_OK:
             print(f'unsubscribe warning {code}: {err}', flush=True)
 
 
-def evaluate_trade_mode(ctx, ticker, side, trade_type, price, spread_pct, d3, d15, d60, dd, m15, m60, daily, last_alert):
+def _pattern_source_tf(pat, p1, p5, p15):
+    if pat is None:
+        return ''
+    if any(pat is p for p in p5):
+        return '5m'
+    if any(pat is p for p in p1):
+        return '1m'
+    if any(pat is p for p in p15):
+        return '15m'
+    return ''
+
+
+def evaluate_trade_mode(ctx, ticker, side, trade_type, price, spread_pct, d1, d3, d5, d15, d60, dd, m15, m60, daily, last_alert):
     micro3 = ema8_vwap_3m(d3)
+    p1, p5, p15 = [], [], []
+
     if trade_type == 'DAY TRADE':
-        entry_df, entry_m, higher_m = d15, m15, m60
-        patterns = detect_patterns(d15)
+        entry_m, higher_m = m15, m60
+        p1 = detect_patterns(d1)
+        p5 = detect_patterns(d5)
+        p15 = detect_patterns(d15)
+        # Prefer 5m structure first, then 1m precision, then the existing 15m structure.
+        patterns = p5 + p1 + p15
         momentum = momentum_snapshot(d15)
     else:
-        entry_df, entry_m, higher_m = d60, m60, daily
+        entry_m, higher_m = m60, daily
         patterns = detect_patterns(d60)
         momentum = momentum_snapshot(d60)
 
@@ -409,18 +429,35 @@ def evaluate_trade_mode(ctx, ticker, side, trade_type, price, spread_pct, d3, d1
     if score < WATCH_SCORE:
         return
 
+    pattern_tf = ''
+    if trade_type == 'DAY TRADE':
+        pattern_tf = _pattern_source_tf(pat, p1, p5, p15)
+        if pattern_tf == '5m':
+            entry_df = d5
+            reasons.append('5m pattern confirmation')
+        elif pattern_tf == '1m':
+            entry_df = d1
+            reasons.append('1m pattern confirmation')
+        else:
+            entry_df = d15
+            if pat:
+                reasons.append('15m pattern confirmation')
+    else:
+        entry_df = d60
+        pattern_tf = '1H' if pat else ''
+
     confirmation = evaluate_confirmation(side=side, df=entry_df, score=score, pattern=pat, min_score=CONFIRMED_SCORE)
     if not confirmation['confirmed']:
-        return  # Chief only sends confirmed signals.
+        return
 
     status = 'CONFIRMED'
-    key = (ticker, side, trade_type, status, pat.name if pat else '')
+    key = (ticker, side, trade_type, status, pattern_tf, pat.name if pat else '')
     if time.time() - last_alert.get(key, 0) <= 1800:
         return
 
     news = news_context(ctx, ticker)
     options = recommend_options(ctx, ticker, side, trade_type=trade_type)
-    notify(format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, micro3, news, options, confirmation, trade_type))
+    notify(format_alert(ticker, side, score, status, price, pat, pattern_tf, reasons, spread_pct, momentum, micro3, news, options, confirmation, trade_type))
     last_alert[key] = time.time()
 
 
@@ -430,7 +467,7 @@ def run():
     last_alert = {}
     candidates = []
     last_universe_refresh = 0.0
-    notify('Chief Bot started. Whole-market scanner connected to live Moomoo data. DAY TRADE + SWING engines, 3m EMA8/VWAP timing, momentum, news, options and price-action confirmation enabled.')
+    notify('Chief Bot started. Whole-market scanner connected to live Moomoo data. DAY TRADE + SWING engines, 1m/5m day-trade patterns, 3m EMA8/VWAP timing, momentum, news, options and price-action confirmation enabled.')
 
     try:
         while True:
@@ -453,7 +490,9 @@ def run():
             for code in candidates:
                 ticker = code.replace('US.', '')
                 try:
+                    d1 = get_bars(ctx, code, KLType.K_1M)
                     d3 = get_bars(ctx, code, KLType.K_3M)
+                    d5 = get_bars(ctx, code, KLType.K_5M)
                     d15 = get_bars(ctx, code, KLType.K_15M)
                     d60 = get_bars(ctx, code, KLType.K_60M)
                     dd = get_bars(ctx, code, KLType.K_DAY)
@@ -464,9 +503,9 @@ def run():
                     m15, m60, daily = metrics(d15), metrics(d60), metrics(dd)
                     for side in ('CALL', 'PUT'):
                         if DAY_TRADING:
-                            evaluate_trade_mode(ctx, ticker, side, 'DAY TRADE', price, spread_pct, d3, d15, d60, dd, m15, m60, daily, last_alert)
+                            evaluate_trade_mode(ctx, ticker, side, 'DAY TRADE', price, spread_pct, d1, d3, d5, d15, d60, dd, m15, m60, daily, last_alert)
                         if SWING_TRADING:
-                            evaluate_trade_mode(ctx, ticker, side, 'SWING', price, spread_pct, d3, d15, d60, dd, m15, m60, daily, last_alert)
+                            evaluate_trade_mode(ctx, ticker, side, 'SWING', price, spread_pct, d1, d3, d5, d15, d60, dd, m15, m60, daily, last_alert)
                 except Exception as e:
                     print(f'{ticker}: {e}', flush=True)
 
