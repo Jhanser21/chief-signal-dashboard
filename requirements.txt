@@ -3,3 +3,6 @@ gunicorn
 python-dotenv
 requests
 pyyaml
+pandas
+numpy
+moomoo-api
