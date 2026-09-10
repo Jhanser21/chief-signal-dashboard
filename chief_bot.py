@@ -1,6 +1,10 @@
 import os, time, requests
 import pandas as pd
+from dotenv import load_dotenv
 from chief_patterns import detect_patterns
+
+# Load local/private runtime settings before reading environment variables.
+load_dotenv('.env')
 
 WATCHLIST = [x.strip().upper() for x in os.getenv('WATCHLIST','QQQ,SPY,NVDA,TSLA,AMD,AMZN,META,GOOGL,AAPL,MSFT,AVGO,ARM,COIN,HIMS').split(',') if x.strip()]
 WATCH_SCORE = float(os.getenv('WATCH_SCORE','7.0'))
