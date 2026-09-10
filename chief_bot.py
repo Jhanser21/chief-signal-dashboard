@@ -109,10 +109,17 @@ def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct):
     atr_note = 'Pattern-based invalidation' if pat and pat.invalidation else 'Use confirmed structure invalidation'
     trigger = f"{pat.trigger:.2f}" if pat and pat.trigger else f"{price:.2f} confirmation"
     invalid = f"{pat.invalidation:.2f}" if pat and pat.invalidation else atr_note
-    return (f"CHIEF {status} {side} | {ticker}\nScore: {score}/10\nPrice: {price:.2f}\n"
+    if status == 'CONFIRMED':
+        icon = '✅'
+        status_text = 'CONFIRMED — BREAK → HOLD → EXPAND'
+    else:
+        icon = '⏳'
+        status_text = 'WAITING FOR CONFIRMATION...'
+    return (f"{icon} CHIEF {status} {side} | {ticker}\n"
+            f"Score: {score}/10\nPrice: {price:.2f}\n"
             f"Spread: {spread_pct:.2f}%\nPattern: {pat.name if pat else 'No A+ pattern yet'}\n"
             f"Trigger: {trigger}\nInvalidation: {invalid}\nWhy: {', '.join(reasons)}\n"
-            f"Status: {'BREAK → HOLD → EXPAND' if status == 'CONFIRMED' else 'WATCHING FOR CONFIRMATION'}")
+            f"Status: {icon} {status_text}")
 
 
 def moomoo_context():
