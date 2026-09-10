@@ -8,11 +8,14 @@ from dotenv import load_dotenv
 from chief_patterns import detect_patterns
 from chief_intelligence import momentum_snapshot, momentum_score, news_context
 from chief_options import recommend_options
+from chief_confirmation import evaluate_confirmation
 
 load_dotenv('.env')
 
 WATCH_SCORE = float(os.getenv('WATCH_SCORE', '7.0'))
-CONFIRMED_SCORE = float(os.getenv('CONFIRMED_SCORE', '8.5'))
+# Chief now treats 8.0 as the confirmation score floor. A score alone does not
+# confirm a trade; price action must also pass evaluate_confirmation().
+CONFIRMED_SCORE = 8.0
 MAX_SPREAD_PCT = float(os.getenv('MAX_SPREAD_PCT', '0.40'))
 MIN_RVOL = float(os.getenv('MIN_RVOL', '1.25'))
 SCAN_SECONDS = int(os.getenv('SCAN_SECONDS', '60'))
@@ -35,7 +38,11 @@ def telegram(msg):
     token = os.getenv('TELEGRAM_BOT_TOKEN', '')
     chat = os.getenv('TELEGRAM_CHAT_ID', '')
     if token and chat:
-        r = requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat, 'text': msg}, timeout=15)
+        r = requests.post(
+            f'https://api.telegram.org/bot{token}/sendMessage',
+            json={'chat_id': chat, 'text': msg},
+            timeout=15,
+        )
         r.raise_for_status()
 
 
@@ -76,67 +83,94 @@ def metrics(df):
     rvol = float(df.volume.iloc[-1] / max(prior_vol, 1))
     bull = e20.iloc[-1] > e50.iloc[-1] and e20.iloc[-1] > e20.iloc[-5] and e50.iloc[-1] > e50.iloc[-5]
     bear = e20.iloc[-1] < e50.iloc[-1] and e20.iloc[-1] < e20.iloc[-5] and e50.iloc[-1] < e50.iloc[-5]
-    return {'bull': bool(bull), 'bear': bool(bear), 'rvol': rvol, 'e20': float(e20.iloc[-1]), 'e50': float(e50.iloc[-1])}
+    return {
+        'bull': bool(bull),
+        'bear': bool(bear),
+        'rvol': rvol,
+        'e20': float(e20.iloc[-1]),
+        'e50': float(e50.iloc[-1]),
+    }
 
 
 def score_setup(side, m15, m60, daily, patterns, momentum, spread_pct=999.0):
     score = 0.0
     reasons = []
-    aligned = ((side == 'CALL' and m60['bull'] and daily['bull']) or (side == 'PUT' and m60['bear'] and daily['bear']))
+    aligned = (
+        (side == 'CALL' and m60['bull'] and daily['bull']) or
+        (side == 'PUT' and m60['bear'] and daily['bear'])
+    )
     if aligned:
         score += 2.5
         reasons.append('HTF trend aligned')
     elif (side == 'CALL' and m60['bull']) or (side == 'PUT' and m60['bear']):
         score += 1.2
         reasons.append('1H trend aligned')
+
     if m15['rvol'] >= MIN_RVOL:
         score += 1.5
         reasons.append(f"RVOL {m15['rvol']:.2f}x")
+
     matching = [p for p in patterns if p.side == side]
     if matching:
         p = matching[0]
         score += min(2.2, 1.0 + p.confidence * 1.4)
         reasons.append(p.name)
-    ema_ok = ((side == 'CALL' and m15['e20'] > m15['e50']) or (side == 'PUT' and m15['e20'] < m15['e50']))
+
+    ema_ok = (
+        (side == 'CALL' and m15['e20'] > m15['e50']) or
+        (side == 'PUT' and m15['e20'] < m15['e50'])
+    )
     if ema_ok:
         score += 1.3
         reasons.append('20/50 EMA structure')
+
     mom_points, mom_reason = momentum_score(side, momentum)
     if mom_points:
         score += mom_points
         reasons.append(mom_reason)
+
     if spread_pct <= MAX_SPREAD_PCT:
         score += 1.0
         reasons.append(f'spread {spread_pct:.2f}%')
+
     return min(round(score, 1), 10.0), reasons, (matching[0] if matching else None)
 
 
-def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, news, options):
+def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, news, options, confirmation):
     atr_note = 'Pattern-based invalidation' if pat and pat.invalidation else 'Use confirmed structure invalidation'
     trigger = f"{pat.trigger:.2f}" if pat and pat.trigger else f"{price:.2f} confirmation"
     invalid = f"{pat.invalidation:.2f}" if pat and pat.invalidation else atr_note
+
     if status == 'CONFIRMED':
         icon = '✅'
-        status_text = 'CONFIRMED — BREAK → HOLD → EXPAND'
+        status_text = 'CONFIRMED — PRICE ACTION VALIDATED'
         options_text = options['text']
     else:
         icon = '⏳'
-        status_text = 'WAITING FOR CONFIRMATION...'
-        options_text = '⏳ Options: Chief will select contracts after the stock setup confirms.'
-    return (f"{icon} CHIEF {status} {side} | {ticker}\n"
-            f"Score: {score}/10\nPrice: {price:.2f}\n"
-            f"Momentum: {momentum['text']}\n"
-            f"Spread: {spread_pct:.2f}%\nPattern: {pat.name if pat else 'No A+ pattern yet'}\n"
-            f"Trigger: {trigger}\nInvalidation: {invalid}\n"
-            f"News: {news['text']}\n"
-            f"Why: {', '.join(reasons)}\n\n"
-            f"{options_text}\n\n"
-            f"Status: {icon} {status_text}")
+        status_text = 'WAITING FOR PRICE-ACTION CONFIRMATION...'
+        options_text = '⏳ Options: Chief will select contracts after price action confirms.'
+
+    return (
+        f"{icon} CHIEF {status} {side} | {ticker}\n"
+        f"Score: {score}/10\nPrice: {price:.2f}\n"
+        f"Momentum: {momentum['text']}\n"
+        f"Spread: {spread_pct:.2f}%\n"
+        f"Pattern: {pat.name if pat else 'No A+ pattern yet'}\n"
+        f"Trigger: {trigger}\nInvalidation: {invalid}\n"
+        f"Confirmation: {confirmation['text']}\n"
+        f"News: {news['text']}\n"
+        f"Why: {', '.join(reasons)}\n\n"
+        f"{options_text}\n\n"
+        f"Status: {icon} {status_text}"
+    )
 
 
 def moomoo_context():
     from moomoo import OpenQuoteContext
-    return OpenQuoteContext(host=os.getenv('MOOMOO_HOST', '127.0.0.1'), port=int(os.getenv('MOOMOO_PORT', '11111')))
+    return OpenQuoteContext(
+        host=os.getenv('MOOMOO_HOST', '127.0.0.1'),
+        port=int(os.getenv('MOOMOO_PORT', '11111')),
+    )
 
 
 def _truthy_series(series):
@@ -213,7 +247,11 @@ def get_snapshots(ctx, codes):
         skipped.extend(bad)
         if batch_no == 1 or batch_no % 5 == 0 or batch_no == batches:
             rows = sum(len(x) for x in frames)
-            print(f'CHIEF stage 1 progress: batch {batch_no}/{batches}, {rows} quoted, {len(skipped)} unsupported skipped', flush=True)
+            print(
+                f'CHIEF stage 1 progress: batch {batch_no}/{batches}, '
+                f'{rows} quoted, {len(skipped)} unsupported skipped',
+                flush=True,
+            )
         time.sleep(0.35)
     if skipped:
         print(f'CHIEF stage 1: skipped {len(set(skipped))} unsupported/unquotable US symbols', flush=True)
@@ -224,22 +262,36 @@ def rank_market_candidates(snapshot):
     if snapshot.empty:
         return []
     d = snapshot.copy()
-    numeric = ['last_price', 'prev_close_price', 'volume', 'turnover', 'volume_ratio', 'ask_price', 'bid_price']
+    numeric = [
+        'last_price', 'prev_close_price', 'volume', 'turnover',
+        'volume_ratio', 'ask_price', 'bid_price',
+    ]
     for c in numeric:
         if c not in d.columns:
             d[c] = 0.0
         d[c] = pd.to_numeric(d[c], errors='coerce').fillna(0.0)
-    d = d[(d.last_price >= MIN_PRICE) & (d.last_price <= MAX_PRICE) & (d.volume >= MIN_VOLUME) &
-          (d.turnover >= MIN_TURNOVER) & (d.prev_close_price > 0)].copy()
+
+    d = d[
+        (d.last_price >= MIN_PRICE) &
+        (d.last_price <= MAX_PRICE) &
+        (d.volume >= MIN_VOLUME) &
+        (d.turnover >= MIN_TURNOVER) &
+        (d.prev_close_price > 0)
+    ].copy()
     if d.empty:
         return []
+
     d['move_pct'] = ((d.last_price / d.prev_close_price) - 1.0).abs() * 100.0
     mid = (d.ask_price + d.bid_price) / 2.0
     d['spread_pct'] = ((d.ask_price - d.bid_price) / mid.replace(0, pd.NA) * 100.0).fillna(999.0)
     d['liquidity_score'] = d.turnover.clip(lower=1).map(lambda x: math.log10(x))
     d['volume_ratio_score'] = d.volume_ratio.clip(lower=0, upper=5)
-    d['market_rank'] = (d.move_pct.clip(upper=15) * 1.8 + d.volume_ratio_score * 1.6 +
-                        d.liquidity_score * 0.9 - d.spread_pct.clip(upper=5) * 2.0)
+    d['market_rank'] = (
+        d.move_pct.clip(upper=15) * 1.8 +
+        d.volume_ratio_score * 1.6 +
+        d.liquidity_score * 0.9 -
+        d.spread_pct.clip(upper=5) * 2.0
+    )
     d = d.sort_values(['market_rank', 'turnover'], ascending=[False, False])
     return d.head(DEEP_CANDIDATES)['code'].astype(str).tolist()
 
@@ -279,7 +331,11 @@ def snapshot_for_code(ctx, code):
 
 def get_bars(ctx, code, ktype, count=300):
     from moomoo import RET_OK, SubType, KLType
-    subtype = {KLType.K_15M: SubType.K_15M, KLType.K_60M: SubType.K_60M, KLType.K_DAY: SubType.K_DAY}[ktype]
+    subtype = {
+        KLType.K_15M: SubType.K_15M,
+        KLType.K_60M: SubType.K_60M,
+        KLType.K_DAY: SubType.K_DAY,
+    }[ktype]
     ret, err = ctx.subscribe([code], [subtype], subscribe_push=False)
     if ret != RET_OK:
         raise RuntimeError(f'subscribe failed {code} {ktype}: {err}')
@@ -306,7 +362,11 @@ def run():
     last_alert = {}
     candidates = []
     last_universe_refresh = 0.0
-    notify('Chief Bot started. Whole-market scanner connected to live Moomoo data. Momentum + news + option recommender enabled.')
+    notify(
+        'Chief Bot started. Whole-market scanner connected to live Moomoo data. '
+        'Momentum + news + options + price-action confirmation enabled.'
+    )
+
     try:
         while True:
             now = time.time()
@@ -324,6 +384,7 @@ def run():
                     print(f'whole-market refresh error: {e}', flush=True)
                     if not candidates:
                         candidates = [f'US.{x}' for x in CORE_WATCHLIST[:DEEP_CANDIDATES]]
+
             for code in candidates:
                 ticker = code.replace('US.', '')
                 try:
@@ -333,20 +394,48 @@ def run():
                     price, spread_pct = snapshot_for_code(ctx, code)
                     if spread_pct > MAX_SPREAD_PCT:
                         continue
+
                     patterns = detect_patterns(d15)
                     momentum = momentum_snapshot(d15)
                     m15, m60, daily = metrics(d15), metrics(d60), metrics(dd)
+
                     for side in ('CALL', 'PUT'):
-                        score, reasons, pat = score_setup(side, m15, m60, daily, patterns, momentum, spread_pct)
-                        status = 'CONFIRMED' if score >= CONFIRMED_SCORE else ('WATCH' if score >= WATCH_SCORE else None)
+                        score, reasons, pat = score_setup(
+                            side, m15, m60, daily, patterns, momentum, spread_pct
+                        )
+
+                        if score < WATCH_SCORE:
+                            continue
+
+                        confirmation = evaluate_confirmation(
+                            side=side,
+                            df=d15,
+                            score=score,
+                            pattern=pat,
+                            min_score=CONFIRMED_SCORE,
+                        )
+
+                        status = 'CONFIRMED' if confirmation['confirmed'] else 'WATCH'
                         key = (ticker, side, status, pat.name if pat else '')
-                        if status and time.time() - last_alert.get(key, 0) > 1800:
+
+                        if time.time() - last_alert.get(key, 0) > 1800:
                             news = news_context(ctx, ticker)
-                            options = recommend_options(ctx, ticker, side) if status == 'CONFIRMED' else {'ok': False, 'text': '', 'picks': []}
-                            notify(format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, news, options))
+                            options = (
+                                recommend_options(ctx, ticker, side)
+                                if status == 'CONFIRMED'
+                                else {'ok': False, 'text': '', 'picks': []}
+                            )
+                            notify(
+                                format_alert(
+                                    ticker, side, score, status, price, pat, reasons,
+                                    spread_pct, momentum, news, options, confirmation,
+                                )
+                            )
                             last_alert[key] = time.time()
+
                 except Exception as e:
                     print(f'{ticker}: {e}', flush=True)
+
             time.sleep(SCAN_SECONDS)
     finally:
         ctx.close()
