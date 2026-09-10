@@ -417,7 +417,6 @@ def evaluate_trade_mode(ctx, ticker, side, trade_type, price, spread_pct, d1, d3
         p1 = detect_patterns(d1)
         p5 = detect_patterns(d5)
         p15 = detect_patterns(d15)
-        # Prefer 5m structure first, then 1m precision, then the existing 15m structure.
         patterns = p5 + p1 + p15
         momentum = momentum_snapshot(d15)
     else:
@@ -457,6 +456,14 @@ def evaluate_trade_mode(ctx, ticker, side, trade_type, price, spread_pct, d1, d3
 
     news = news_context(ctx, ticker)
     options = recommend_options(ctx, ticker, side, trade_type=trade_type)
+    if not options.get('ok'):
+        print(
+            f"{ticker} {trade_type} {side}: confirmed underlying setup but no valid options contract yet: "
+            f"{options.get('text', 'option scan failed')}",
+            flush=True,
+        )
+        return  # Do not send a signal unless Chief can include a valid contract.
+
     notify(format_alert(ticker, side, score, status, price, pat, pattern_tf, reasons, spread_pct, momentum, micro3, news, options, confirmation, trade_type))
     last_alert[key] = time.time()
 
