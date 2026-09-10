@@ -1,5 +1,15 @@
 import math
 
+# Chief Discord card hook: chief_bot imports requests before this module, so
+# installing the hook here upgrades only Discord signal webhook posts while
+# leaving Telegram and all market-data HTTP behavior untouched.
+try:
+    import requests as _requests
+    from chief_discord_card import install_discord_card_hook
+    install_discord_card_hook(_requests)
+except Exception as _card_hook_error:
+    print(f'Discord card hook warning: {_card_hook_error}', flush=True)
+
 
 def _avg(series):
     vals = [float(x) for x in series if x is not None]
