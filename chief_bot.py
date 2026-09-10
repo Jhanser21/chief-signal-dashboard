@@ -13,12 +13,12 @@ from chief_confirmation import evaluate_confirmation
 load_dotenv('.env')
 
 WATCH_SCORE = float(os.getenv('WATCH_SCORE', '7.0'))
-# Chief now treats 8.0 as the confirmation score floor. A score alone does not
-# confirm a trade; price action must also pass evaluate_confirmation().
 CONFIRMED_SCORE = 8.0
 MAX_SPREAD_PCT = float(os.getenv('MAX_SPREAD_PCT', '0.40'))
 MIN_RVOL = float(os.getenv('MIN_RVOL', '1.25'))
 SCAN_SECONDS = int(os.getenv('SCAN_SECONDS', '60'))
+DAY_TRADING = os.getenv('DAY_TRADING', 'true').lower() in ('1', 'true', 'yes', 'on')
+SWING_TRADING = os.getenv('SWING_TRADING', 'true').lower() in ('1', 'true', 'yes', 'on')
 
 WHOLE_MARKET = os.getenv('WHOLE_MARKET', 'true').lower() in ('1', 'true', 'yes', 'on')
 DEEP_CANDIDATES = int(os.getenv('DEEP_CANDIDATES', '24'))
@@ -92,23 +92,23 @@ def metrics(df):
     }
 
 
-def score_setup(side, m15, m60, daily, patterns, momentum, spread_pct=999.0):
+def score_setup(side, entry_m, higher_m, daily, patterns, momentum, spread_pct=999.0, trade_type='DAY TRADE'):
     score = 0.0
     reasons = []
     aligned = (
-        (side == 'CALL' and m60['bull'] and daily['bull']) or
-        (side == 'PUT' and m60['bear'] and daily['bear'])
+        (side == 'CALL' and higher_m['bull'] and daily['bull']) or
+        (side == 'PUT' and higher_m['bear'] and daily['bear'])
     )
     if aligned:
         score += 2.5
         reasons.append('HTF trend aligned')
-    elif (side == 'CALL' and m60['bull']) or (side == 'PUT' and m60['bear']):
+    elif (side == 'CALL' and higher_m['bull']) or (side == 'PUT' and higher_m['bear']):
         score += 1.2
-        reasons.append('1H trend aligned')
+        reasons.append('Higher-timeframe trend aligned')
 
-    if m15['rvol'] >= MIN_RVOL:
+    if entry_m['rvol'] >= MIN_RVOL:
         score += 1.5
-        reasons.append(f"RVOL {m15['rvol']:.2f}x")
+        reasons.append(f"RVOL {entry_m['rvol']:.2f}x")
 
     matching = [p for p in patterns if p.side == side]
     if matching:
@@ -117,8 +117,8 @@ def score_setup(side, m15, m60, daily, patterns, momentum, spread_pct=999.0):
         reasons.append(p.name)
 
     ema_ok = (
-        (side == 'CALL' and m15['e20'] > m15['e50']) or
-        (side == 'PUT' and m15['e20'] < m15['e50'])
+        (side == 'CALL' and entry_m['e20'] > entry_m['e50']) or
+        (side == 'PUT' and entry_m['e20'] < entry_m['e50'])
     )
     if ema_ok:
         score += 1.3
@@ -133,10 +133,13 @@ def score_setup(side, m15, m60, daily, patterns, momentum, spread_pct=999.0):
         score += 1.0
         reasons.append(f'spread {spread_pct:.2f}%')
 
+    if trade_type == 'SWING' and aligned:
+        reasons.append('Swing trend structure')
+
     return min(round(score, 1), 10.0), reasons, (matching[0] if matching else None)
 
 
-def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, news, options, confirmation):
+def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, news, options, confirmation, trade_type):
     atr_note = 'Pattern-based invalidation' if pat and pat.invalidation else 'Use confirmed structure invalidation'
     trigger = f"{pat.trigger:.2f}" if pat and pat.trigger else f"{price:.2f} confirmation"
     invalid = f"{pat.invalidation:.2f}" if pat and pat.invalidation else atr_note
@@ -150,9 +153,12 @@ def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, m
         status_text = 'WAITING FOR PRICE-ACTION CONFIRMATION...'
         options_text = '⏳ Options: Chief will select contracts after price action confirms.'
 
+    timeframe_text = '15m execution / 1H + Daily bias' if trade_type == 'DAY TRADE' else '1H execution / Daily swing bias'
+
     return (
-        f"{icon} CHIEF {status} {side} | {ticker}\n"
+        f"{icon} CHIEF {status} {side} | {ticker} | {trade_type}\n"
         f"Score: {score}/10\nPrice: {price:.2f}\n"
+        f"Style: {trade_type} | {timeframe_text}\n"
         f"Momentum: {momentum['text']}\n"
         f"Spread: {spread_pct:.2f}%\n"
         f"Pattern: {pat.name if pat else 'No A+ pattern yet'}\n"
@@ -174,7 +180,6 @@ def moomoo_context():
 
 
 def _truthy_series(series):
-    """Normalize Moomoo boolean-like fields; strings such as 'False' must stay false."""
     return series.fillna(False).map(lambda v: str(v).strip().lower() in ('true', '1', 'yes', 'y'))
 
 
@@ -247,11 +252,7 @@ def get_snapshots(ctx, codes):
         skipped.extend(bad)
         if batch_no == 1 or batch_no % 5 == 0 or batch_no == batches:
             rows = sum(len(x) for x in frames)
-            print(
-                f'CHIEF stage 1 progress: batch {batch_no}/{batches}, '
-                f'{rows} quoted, {len(skipped)} unsupported skipped',
-                flush=True,
-            )
+            print(f'CHIEF stage 1 progress: batch {batch_no}/{batches}, {rows} quoted, {len(skipped)} unsupported skipped', flush=True)
         time.sleep(0.35)
     if skipped:
         print(f'CHIEF stage 1: skipped {len(set(skipped))} unsupported/unquotable US symbols', flush=True)
@@ -262,36 +263,22 @@ def rank_market_candidates(snapshot):
     if snapshot.empty:
         return []
     d = snapshot.copy()
-    numeric = [
-        'last_price', 'prev_close_price', 'volume', 'turnover',
-        'volume_ratio', 'ask_price', 'bid_price',
-    ]
+    numeric = ['last_price', 'prev_close_price', 'volume', 'turnover', 'volume_ratio', 'ask_price', 'bid_price']
     for c in numeric:
         if c not in d.columns:
             d[c] = 0.0
         d[c] = pd.to_numeric(d[c], errors='coerce').fillna(0.0)
-
-    d = d[
-        (d.last_price >= MIN_PRICE) &
-        (d.last_price <= MAX_PRICE) &
-        (d.volume >= MIN_VOLUME) &
-        (d.turnover >= MIN_TURNOVER) &
-        (d.prev_close_price > 0)
-    ].copy()
+    d = d[(d.last_price >= MIN_PRICE) & (d.last_price <= MAX_PRICE) & (d.volume >= MIN_VOLUME) &
+          (d.turnover >= MIN_TURNOVER) & (d.prev_close_price > 0)].copy()
     if d.empty:
         return []
-
     d['move_pct'] = ((d.last_price / d.prev_close_price) - 1.0).abs() * 100.0
     mid = (d.ask_price + d.bid_price) / 2.0
     d['spread_pct'] = ((d.ask_price - d.bid_price) / mid.replace(0, pd.NA) * 100.0).fillna(999.0)
     d['liquidity_score'] = d.turnover.clip(lower=1).map(lambda x: math.log10(x))
     d['volume_ratio_score'] = d.volume_ratio.clip(lower=0, upper=5)
-    d['market_rank'] = (
-        d.move_pct.clip(upper=15) * 1.8 +
-        d.volume_ratio_score * 1.6 +
-        d.liquidity_score * 0.9 -
-        d.spread_pct.clip(upper=5) * 2.0
-    )
+    d['market_rank'] = (d.move_pct.clip(upper=15) * 1.8 + d.volume_ratio_score * 1.6 +
+                        d.liquidity_score * 0.9 - d.spread_pct.clip(upper=5) * 2.0)
     d = d.sort_values(['market_rank', 'turnover'], ascending=[False, False])
     return d.head(DEEP_CANDIDATES)['code'].astype(str).tolist()
 
@@ -331,11 +318,7 @@ def snapshot_for_code(ctx, code):
 
 def get_bars(ctx, code, ktype, count=300):
     from moomoo import RET_OK, SubType, KLType
-    subtype = {
-        KLType.K_15M: SubType.K_15M,
-        KLType.K_60M: SubType.K_60M,
-        KLType.K_DAY: SubType.K_DAY,
-    }[ktype]
+    subtype = {KLType.K_15M: SubType.K_15M, KLType.K_60M: SubType.K_60M, KLType.K_DAY: SubType.K_DAY}[ktype]
     ret, err = ctx.subscribe([code], [subtype], subscribe_push=False)
     if ret != RET_OK:
         raise RuntimeError(f'subscribe failed {code} {ktype}: {err}')
@@ -356,6 +339,51 @@ def release_removed_candidates(ctx, removed):
             print(f'unsubscribe warning {code}: {err}', flush=True)
 
 
+def evaluate_trade_mode(ctx, ticker, side, trade_type, price, spread_pct, d15, d60, dd, m15, m60, daily, last_alert):
+    if trade_type == 'DAY TRADE':
+        entry_df = d15
+        entry_m = m15
+        higher_m = m60
+        patterns = detect_patterns(d15)
+        momentum = momentum_snapshot(d15)
+    else:
+        entry_df = d60
+        entry_m = m60
+        higher_m = daily
+        patterns = detect_patterns(d60)
+        momentum = momentum_snapshot(d60)
+
+    score, reasons, pat = score_setup(
+        side, entry_m, higher_m, daily, patterns, momentum, spread_pct, trade_type
+    )
+    if score < WATCH_SCORE:
+        return
+
+    confirmation = evaluate_confirmation(
+        side=side,
+        df=entry_df,
+        score=score,
+        pattern=pat,
+        min_score=CONFIRMED_SCORE,
+    )
+    status = 'CONFIRMED' if confirmation['confirmed'] else 'WATCH'
+    key = (ticker, side, trade_type, status, pat.name if pat else '')
+    if time.time() - last_alert.get(key, 0) <= 1800:
+        return
+
+    news = news_context(ctx, ticker)
+    options = (
+        recommend_options(ctx, ticker, side, trade_type=trade_type)
+        if status == 'CONFIRMED'
+        else {'ok': False, 'text': '', 'picks': []}
+    )
+    notify(format_alert(
+        ticker, side, score, status, price, pat, reasons,
+        spread_pct, momentum, news, options, confirmation, trade_type,
+    ))
+    last_alert[key] = time.time()
+
+
 def run():
     from moomoo import KLType
     ctx = moomoo_context()
@@ -364,7 +392,7 @@ def run():
     last_universe_refresh = 0.0
     notify(
         'Chief Bot started. Whole-market scanner connected to live Moomoo data. '
-        'Momentum + news + options + price-action confirmation enabled.'
+        'DAY TRADE + SWING engines, momentum, news, options and price-action confirmation enabled.'
     )
 
     try:
@@ -395,44 +423,18 @@ def run():
                     if spread_pct > MAX_SPREAD_PCT:
                         continue
 
-                    patterns = detect_patterns(d15)
-                    momentum = momentum_snapshot(d15)
                     m15, m60, daily = metrics(d15), metrics(d60), metrics(dd)
-
                     for side in ('CALL', 'PUT'):
-                        score, reasons, pat = score_setup(
-                            side, m15, m60, daily, patterns, momentum, spread_pct
-                        )
-
-                        if score < WATCH_SCORE:
-                            continue
-
-                        confirmation = evaluate_confirmation(
-                            side=side,
-                            df=d15,
-                            score=score,
-                            pattern=pat,
-                            min_score=CONFIRMED_SCORE,
-                        )
-
-                        status = 'CONFIRMED' if confirmation['confirmed'] else 'WATCH'
-                        key = (ticker, side, status, pat.name if pat else '')
-
-                        if time.time() - last_alert.get(key, 0) > 1800:
-                            news = news_context(ctx, ticker)
-                            options = (
-                                recommend_options(ctx, ticker, side)
-                                if status == 'CONFIRMED'
-                                else {'ok': False, 'text': '', 'picks': []}
+                        if DAY_TRADING:
+                            evaluate_trade_mode(
+                                ctx, ticker, side, 'DAY TRADE', price, spread_pct,
+                                d15, d60, dd, m15, m60, daily, last_alert,
                             )
-                            notify(
-                                format_alert(
-                                    ticker, side, score, status, price, pat, reasons,
-                                    spread_pct, momentum, news, options, confirmation,
-                                )
+                        if SWING_TRADING:
+                            evaluate_trade_mode(
+                                ctx, ticker, side, 'SWING', price, spread_pct,
+                                d15, d60, dd, m15, m60, daily, last_alert,
                             )
-                            last_alert[key] = time.time()
-
                 except Exception as e:
                     print(f'{ticker}: {e}', flush=True)
 
