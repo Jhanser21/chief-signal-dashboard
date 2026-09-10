@@ -1,0 +1,8 @@
+[Unit]
+Description=Chief Signal Bot automatic GitHub updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/chief-signal-dashboard/deploy/chief-auto-update.sh
