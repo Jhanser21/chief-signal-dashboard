@@ -33,11 +33,7 @@ def telegram(msg):
     token = os.getenv('TELEGRAM_BOT_TOKEN', '')
     chat = os.getenv('TELEGRAM_CHAT_ID', '')
     if token and chat:
-        r = requests.post(
-            f'https://api.telegram.org/bot{token}/sendMessage',
-            json={'chat_id': chat, 'text': msg},
-            timeout=15,
-        )
+        r = requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat, 'text': msg}, timeout=15)
         r.raise_for_status()
 
 
@@ -78,15 +74,13 @@ def metrics(df):
     rvol = float(df.volume.iloc[-1] / max(prior_vol, 1))
     bull = e20.iloc[-1] > e50.iloc[-1] and e20.iloc[-1] > e20.iloc[-5] and e50.iloc[-1] > e50.iloc[-5]
     bear = e20.iloc[-1] < e50.iloc[-1] and e20.iloc[-1] < e20.iloc[-5] and e50.iloc[-1] < e50.iloc[-5]
-    return {'bull': bool(bull), 'bear': bool(bear), 'rvol': rvol,
-            'e20': float(e20.iloc[-1]), 'e50': float(e50.iloc[-1])}
+    return {'bull': bool(bull), 'bear': bool(bear), 'rvol': rvol, 'e20': float(e20.iloc[-1]), 'e50': float(e50.iloc[-1])}
 
 
 def score_setup(side, m15, m60, daily, patterns, spread_pct=999.0):
     score = 0.0
     reasons = []
-    aligned = ((side == 'CALL' and m60['bull'] and daily['bull']) or
-               (side == 'PUT' and m60['bear'] and daily['bear']))
+    aligned = ((side == 'CALL' and m60['bull'] and daily['bull']) or (side == 'PUT' and m60['bear'] and daily['bear']))
     if aligned:
         score += 2.5
         reasons.append('HTF trend aligned')
@@ -101,8 +95,7 @@ def score_setup(side, m15, m60, daily, patterns, spread_pct=999.0):
         p = matching[0]
         score += min(2.2, 1.0 + p.confidence * 1.4)
         reasons.append(p.name)
-    ema_ok = ((side == 'CALL' and m15['e20'] > m15['e50']) or
-              (side == 'PUT' and m15['e20'] < m15['e50']))
+    ema_ok = ((side == 'CALL' and m15['e20'] > m15['e50']) or (side == 'PUT' and m15['e20'] < m15['e50']))
     if ema_ok:
         score += 1.3
         reasons.append('20/50 EMA structure')
@@ -116,18 +109,20 @@ def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct):
     atr_note = 'Pattern-based invalidation' if pat and pat.invalidation else 'Use confirmed structure invalidation'
     trigger = f"{pat.trigger:.2f}" if pat and pat.trigger else f"{price:.2f} confirmation"
     invalid = f"{pat.invalidation:.2f}" if pat and pat.invalidation else atr_note
-    return (
-        f"CHIEF {status} {side} | {ticker}\nScore: {score}/10\nPrice: {price:.2f}\n"
-        f"Spread: {spread_pct:.2f}%\nPattern: {pat.name if pat else 'No A+ pattern yet'}\n"
-        f"Trigger: {trigger}\nInvalidation: {invalid}\nWhy: {', '.join(reasons)}\n"
-        f"Status: {'BREAK → HOLD → EXPAND' if status == 'CONFIRMED' else 'WATCHING FOR CONFIRMATION'}"
-    )
+    return (f"CHIEF {status} {side} | {ticker}\nScore: {score}/10\nPrice: {price:.2f}\n"
+            f"Spread: {spread_pct:.2f}%\nPattern: {pat.name if pat else 'No A+ pattern yet'}\n"
+            f"Trigger: {trigger}\nInvalidation: {invalid}\nWhy: {', '.join(reasons)}\n"
+            f"Status: {'BREAK → HOLD → EXPAND' if status == 'CONFIRMED' else 'WATCHING FOR CONFIRMATION'}")
 
 
 def moomoo_context():
     from moomoo import OpenQuoteContext
-    return OpenQuoteContext(host=os.getenv('MOOMOO_HOST', '127.0.0.1'),
-                            port=int(os.getenv('MOOMOO_PORT', '11111')))
+    return OpenQuoteContext(host=os.getenv('MOOMOO_HOST', '127.0.0.1'), port=int(os.getenv('MOOMOO_PORT', '11111')))
+
+
+def _truthy_series(series):
+    """Normalize Moomoo boolean-like fields; strings such as 'False' must stay false."""
+    return series.fillna(False).map(lambda v: str(v).strip().lower() in ('true', '1', 'yes', 'y'))
 
 
 def get_us_stock_universe(ctx):
@@ -137,18 +132,18 @@ def get_us_stock_universe(ctx):
         raise RuntimeError(f'get_stock_basicinfo failed: {data}')
     if data is None or data.empty or 'code' not in data.columns:
         raise RuntimeError('Moomoo returned an empty US stock universe')
+    raw_count = len(data)
     if 'delisting' in data.columns:
-        data = data[~data['delisting'].fillna(False).astype(bool)].copy()
+        data = data[~_truthy_series(data['delisting'])].copy()
     if 'suspension' in data.columns:
-        data = data[~data['suspension'].fillna(False).astype(bool)].copy()
+        data = data[~_truthy_series(data['suspension'])].copy()
     codes = data['code'].dropna().astype(str).drop_duplicates().tolist()
-    print(f'CHIEF universe: {len(codes)} active US symbols from Moomoo', flush=True)
+    print(f'CHIEF universe: {len(codes)} active US symbols from {raw_count} Moomoo records', flush=True)
     return codes
 
 
 def _unsupported_code_from_error(err, batch):
     text = str(err)
-    # OpenD commonly reports: "US OTC market quote is not available for XYZ."
     m = re.search(r'not available for\s+([A-Z0-9.\-]+)', text, re.I)
     if not m:
         return None
@@ -164,11 +159,8 @@ def _snapshot_resilient(ctx, batch, depth=0):
     from moomoo import RET_OK
     if not batch:
         return [], []
-
     working = list(batch)
     skipped = []
-
-    # First remove symbols OpenD explicitly identifies as unsupported, then retry.
     for _ in range(min(30, len(working))):
         ret, data = ctx.get_market_snapshot(working)
         if ret == RET_OK and data is not None and not data.empty:
@@ -182,11 +174,8 @@ def _snapshot_resilient(ctx, batch, depth=0):
             time.sleep(0.08)
             continue
         break
-
     if len(working) == 1:
         return [], skipped + working
-
-    # Unknown mixed-batch failure: bisect so valid listed symbols are still retained.
     mid = len(working) // 2
     left_frames, left_skipped = _snapshot_resilient(ctx, working[:mid], depth + 1)
     right_frames, right_skipped = _snapshot_resilient(ctx, working[mid:], depth + 1)
@@ -221,9 +210,8 @@ def rank_market_candidates(snapshot):
         if c not in d.columns:
             d[c] = 0.0
         d[c] = pd.to_numeric(d[c], errors='coerce').fillna(0.0)
-    d = d[(d.last_price >= MIN_PRICE) & (d.last_price <= MAX_PRICE) &
-          (d.volume >= MIN_VOLUME) & (d.turnover >= MIN_TURNOVER) &
-          (d.prev_close_price > 0)].copy()
+    d = d[(d.last_price >= MIN_PRICE) & (d.last_price <= MAX_PRICE) & (d.volume >= MIN_VOLUME) &
+          (d.turnover >= MIN_TURNOVER) & (d.prev_close_price > 0)].copy()
     if d.empty:
         return []
     d['move_pct'] = ((d.last_price / d.prev_close_price) - 1.0).abs() * 100.0
@@ -245,9 +233,6 @@ def build_deep_scan_list(ctx):
     snap = get_snapshots(ctx, universe)
     print(f'CHIEF stage 1: received usable snapshots for {len(snap)} symbols', flush=True)
     ranked = rank_market_candidates(snap)
-
-    # Ranked market candidates come first. Core names fill any unused slots, so the
-    # broad-market scan can actually surface new names instead of being crowded out.
     combined = []
     for code in ranked + [f'US.{x}' for x in CORE_WATCHLIST]:
         if code not in combined:
@@ -275,8 +260,7 @@ def snapshot_for_code(ctx, code):
 
 def get_bars(ctx, code, ktype, count=300):
     from moomoo import RET_OK, SubType, KLType
-    subtype = {KLType.K_15M: SubType.K_15M, KLType.K_60M: SubType.K_60M,
-               KLType.K_DAY: SubType.K_DAY}[ktype]
+    subtype = {KLType.K_15M: SubType.K_15M, KLType.K_60M: SubType.K_60M, KLType.K_DAY: SubType.K_DAY}[ktype]
     ret, err = ctx.subscribe([code], [subtype], subscribe_push=False)
     if ret != RET_OK:
         raise RuntimeError(f'subscribe failed {code} {ktype}: {err}')
@@ -321,7 +305,6 @@ def run():
                     print(f'whole-market refresh error: {e}', flush=True)
                     if not candidates:
                         candidates = [f'US.{x}' for x in CORE_WATCHLIST[:DEEP_CANDIDATES]]
-
             for code in candidates:
                 ticker = code.replace('US.', '')
                 try:
