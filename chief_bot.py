@@ -7,6 +7,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from chief_patterns import detect_patterns
 from chief_intelligence import momentum_snapshot, momentum_score, news_context
+from chief_options import recommend_options
 
 load_dotenv('.env')
 
@@ -110,23 +111,26 @@ def score_setup(side, m15, m60, daily, patterns, momentum, spread_pct=999.0):
     return min(round(score, 1), 10.0), reasons, (matching[0] if matching else None)
 
 
-def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, news):
+def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, news, options):
     atr_note = 'Pattern-based invalidation' if pat and pat.invalidation else 'Use confirmed structure invalidation'
     trigger = f"{pat.trigger:.2f}" if pat and pat.trigger else f"{price:.2f} confirmation"
     invalid = f"{pat.invalidation:.2f}" if pat and pat.invalidation else atr_note
     if status == 'CONFIRMED':
         icon = '✅'
         status_text = 'CONFIRMED — BREAK → HOLD → EXPAND'
+        options_text = options['text']
     else:
         icon = '⏳'
         status_text = 'WAITING FOR CONFIRMATION...'
+        options_text = '⏳ Options: Chief will select contracts after the stock setup confirms.'
     return (f"{icon} CHIEF {status} {side} | {ticker}\n"
             f"Score: {score}/10\nPrice: {price:.2f}\n"
             f"Momentum: {momentum['text']}\n"
             f"Spread: {spread_pct:.2f}%\nPattern: {pat.name if pat else 'No A+ pattern yet'}\n"
             f"Trigger: {trigger}\nInvalidation: {invalid}\n"
             f"News: {news['text']}\n"
-            f"Why: {', '.join(reasons)}\n"
+            f"Why: {', '.join(reasons)}\n\n"
+            f"{options_text}\n\n"
             f"Status: {icon} {status_text}")
 
 
@@ -302,7 +306,7 @@ def run():
     last_alert = {}
     candidates = []
     last_universe_refresh = 0.0
-    notify('Chief Bot started. Whole-market scanner connected to live Moomoo data. Momentum + Moomoo news context enabled.')
+    notify('Chief Bot started. Whole-market scanner connected to live Moomoo data. Momentum + news + option recommender enabled.')
     try:
         while True:
             now = time.time()
@@ -338,7 +342,8 @@ def run():
                         key = (ticker, side, status, pat.name if pat else '')
                         if status and time.time() - last_alert.get(key, 0) > 1800:
                             news = news_context(ctx, ticker)
-                            notify(format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, news))
+                            options = recommend_options(ctx, ticker, side) if status == 'CONFIRMED' else {'ok': False, 'text': '', 'picks': []}
+                            notify(format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, news, options))
                             last_alert[key] = time.time()
                 except Exception as e:
                     print(f'{ticker}: {e}', flush=True)
