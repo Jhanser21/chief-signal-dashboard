@@ -6,6 +6,7 @@ import requests
 import pandas as pd
 from dotenv import load_dotenv
 from chief_patterns import detect_patterns
+from chief_intelligence import momentum_snapshot, momentum_score, news_context
 
 load_dotenv('.env')
 
@@ -77,7 +78,7 @@ def metrics(df):
     return {'bull': bool(bull), 'bear': bool(bear), 'rvol': rvol, 'e20': float(e20.iloc[-1]), 'e50': float(e50.iloc[-1])}
 
 
-def score_setup(side, m15, m60, daily, patterns, spread_pct=999.0):
+def score_setup(side, m15, m60, daily, patterns, momentum, spread_pct=999.0):
     score = 0.0
     reasons = []
     aligned = ((side == 'CALL' and m60['bull'] and daily['bull']) or (side == 'PUT' and m60['bear'] and daily['bear']))
@@ -99,13 +100,17 @@ def score_setup(side, m15, m60, daily, patterns, spread_pct=999.0):
     if ema_ok:
         score += 1.3
         reasons.append('20/50 EMA structure')
+    mom_points, mom_reason = momentum_score(side, momentum)
+    if mom_points:
+        score += mom_points
+        reasons.append(mom_reason)
     if spread_pct <= MAX_SPREAD_PCT:
         score += 1.0
         reasons.append(f'spread {spread_pct:.2f}%')
     return min(round(score, 1), 10.0), reasons, (matching[0] if matching else None)
 
 
-def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct):
+def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, news):
     atr_note = 'Pattern-based invalidation' if pat and pat.invalidation else 'Use confirmed structure invalidation'
     trigger = f"{pat.trigger:.2f}" if pat and pat.trigger else f"{price:.2f} confirmation"
     invalid = f"{pat.invalidation:.2f}" if pat and pat.invalidation else atr_note
@@ -117,8 +122,11 @@ def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct):
         status_text = 'WAITING FOR CONFIRMATION...'
     return (f"{icon} CHIEF {status} {side} | {ticker}\n"
             f"Score: {score}/10\nPrice: {price:.2f}\n"
+            f"Momentum: {momentum['text']}\n"
             f"Spread: {spread_pct:.2f}%\nPattern: {pat.name if pat else 'No A+ pattern yet'}\n"
-            f"Trigger: {trigger}\nInvalidation: {invalid}\nWhy: {', '.join(reasons)}\n"
+            f"Trigger: {trigger}\nInvalidation: {invalid}\n"
+            f"News: {news['text']}\n"
+            f"Why: {', '.join(reasons)}\n"
             f"Status: {icon} {status_text}")
 
 
@@ -294,7 +302,7 @@ def run():
     last_alert = {}
     candidates = []
     last_universe_refresh = 0.0
-    notify('Chief Bot started. Whole-market scanner connected to live Moomoo data.')
+    notify('Chief Bot started. Whole-market scanner connected to live Moomoo data. Momentum + Moomoo news context enabled.')
     try:
         while True:
             now = time.time()
@@ -322,13 +330,15 @@ def run():
                     if spread_pct > MAX_SPREAD_PCT:
                         continue
                     patterns = detect_patterns(d15)
+                    momentum = momentum_snapshot(d15)
                     m15, m60, daily = metrics(d15), metrics(d60), metrics(dd)
                     for side in ('CALL', 'PUT'):
-                        score, reasons, pat = score_setup(side, m15, m60, daily, patterns, spread_pct)
+                        score, reasons, pat = score_setup(side, m15, m60, daily, patterns, momentum, spread_pct)
                         status = 'CONFIRMED' if score >= CONFIRMED_SCORE else ('WATCH' if score >= WATCH_SCORE else None)
                         key = (ticker, side, status, pat.name if pat else '')
                         if status and time.time() - last_alert.get(key, 0) > 1800:
-                            notify(format_alert(ticker, side, score, status, price, pat, reasons, spread_pct))
+                            news = news_context(ctx, ticker)
+                            notify(format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, news))
                             last_alert[key] = time.time()
                 except Exception as e:
                     print(f'{ticker}: {e}', flush=True)
