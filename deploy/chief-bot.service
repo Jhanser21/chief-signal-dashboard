@@ -1,0 +1,16 @@
+[Unit]
+Description=Chief Signal Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chief
+WorkingDirectory=/opt/chief-signal-dashboard
+EnvironmentFile=/opt/chief-signal-dashboard/.env
+ExecStart=/opt/chief-signal-dashboard/.venv/bin/python /opt/chief-signal-dashboard/chief_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
