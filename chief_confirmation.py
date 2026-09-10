@@ -1,4 +1,6 @@
 import math
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # Chief Discord card hook: chief_bot imports requests before this module, so
 # installing the hook here upgrades only Discord signal webhook posts while
@@ -24,7 +26,7 @@ def _resend_avgo_once():
             return
 
         def _send():
-            time.sleep(4)  # allow chief_bot to load .env after imports finish
+            time.sleep(4)
             load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
             url = os.getenv('DISCORD_WEBHOOK_URL', '')
             if not url or os.path.exists(marker):
@@ -58,18 +60,62 @@ def _resend_avgo_once():
 _resend_avgo_once()
 
 
-def _avg(series):
-    vals = [float(x) for x in series if x is not None]
-    return sum(vals) / len(vals) if vals else 0.0
+def _is_power_hour():
+    """US equity power hour: 3:00 PM through 4:00 PM New York time on weekdays."""
+    now = datetime.now(ZoneInfo('America/New_York'))
+    return now.weekday() < 5 and now.hour == 15
+
+
+def _power_hour_mover(side, d):
+    """Detect late-day acceleration using price expansion + volume + structure.
+
+    Works best when confirmation receives a 1m or 5m dataframe, which is how
+    Chief confirms day-trade patterns. This does not create an unconfirmed alert;
+    it is extra evidence toward an already high-quality confirmed setup.
+    """
+    if not _is_power_hour() or d is None or len(d) < 20:
+        return False, ''
+
+    close = d['close'].astype(float)
+    high = d['high'].astype(float)
+    low = d['low'].astype(float)
+    volume = d['volume'].astype(float)
+
+    last = float(close.iloc[-1])
+    prev5 = float(close.iloc[-6])
+    move5 = ((last / prev5) - 1.0) * 100.0 if prev5 else 0.0
+
+    avg_vol = float(volume.iloc[-21:-1].mean()) if len(volume) >= 21 else float(volume.iloc[:-1].mean())
+    vol_ratio = float(volume.iloc[-1] / max(avg_vol, 1.0))
+
+    recent_high = float(high.iloc[-11:-1].max())
+    recent_low = float(low.iloc[-11:-1].min())
+    range_now = float(high.iloc[-1] - low.iloc[-1])
+    avg_range = float((high.iloc[-11:-1] - low.iloc[-11:-1]).mean())
+    range_expand = range_now >= max(avg_range * 1.20, 1e-9)
+
+    if side == 'CALL':
+        directional = move5 >= 0.30
+        structure = last >= recent_high
+    else:
+        directional = move5 <= -0.30
+        structure = last <= recent_low
+
+    mover = bool(directional and vol_ratio >= 1.20 and (structure or range_expand))
+    if not mover:
+        return False, ''
+
+    direction = 'UPSIDE' if side == 'CALL' else 'DOWNSIDE'
+    text = f'POWER HOUR {direction} MOVER | 5-bar move {move5:+.2f}% | Volume {vol_ratio:.2f}x'
+    return True, text
 
 
 def evaluate_confirmation(side, df, score, pattern=None, min_score=8.0):
     """Confirm a Chief setup with price action, not score alone.
 
-    Confirmation requires score >= min_score plus directional momentum and a
-    real price-action trigger. It recognizes pattern-trigger breaks, recent
-    structure breaks, breakout holds/retests, rejection candles, and volume
-    expansion. Returns a dict suitable for Telegram display.
+    Confirmation requires score >= min_score plus a real directional trigger.
+    During 3:00-4:00 PM ET, Chief also looks for power-hour acceleration:
+    strong short-term direction, volume expansion, and a structure/range break.
     """
     if df is None or len(df) < 25:
         return {
@@ -112,14 +158,20 @@ def evaluate_confirmation(side, df, score, pattern=None, min_score=8.0):
     score_ok = float(score) >= float(min_score)
     checks.append(('Score ≥ %.1f' % min_score, score_ok))
 
-    directional_candle = (last_close > last_open and last_close > prev_close if bullish else last_close < last_open and last_close < prev_close)
+    directional_candle = (
+        last_close > last_open and last_close > prev_close
+        if bullish else
+        last_close < last_open and last_close < prev_close
+    )
     checks.append(('Directional candle', directional_candle))
 
     structure_break = last_close > prior_high if bullish else last_close < prior_low
     micro_structure_break = last_close > short_high if bullish else last_close < short_low
+
     pattern_break = False
     if pattern_trigger is not None:
         pattern_break = last_close >= pattern_trigger if bullish else last_close <= pattern_trigger
+
     trigger_ok = pattern_break or structure_break or micro_structure_break
     checks.append(('Trigger/BOS', trigger_ok))
 
@@ -136,20 +188,45 @@ def evaluate_confirmation(side, df, score, pattern=None, min_score=8.0):
     candle_range = max(last_high - last_low, 1e-9)
     lower_wick = min(last_open, last_close) - last_low
     upper_wick = last_high - max(last_open, last_close)
-    rejection = (lower_wick / candle_range >= 0.35 and last_close > last_open if bullish else upper_wick / candle_range >= 0.35 and last_close < last_open)
+    rejection = (
+        lower_wick / candle_range >= 0.35 and last_close > last_open
+        if bullish else
+        upper_wick / candle_range >= 0.35 and last_close < last_open
+    )
     checks.append(('Rejection', rejection))
 
     volume_ok = vol_ratio >= 1.15
     checks.append((f'Volume {vol_ratio:.2f}x', volume_ok))
-    supporting = sum(bool(x) for x in (directional_candle, hold_ok, rejection, volume_ok))
+
+    power_mover, power_text = _power_hour_mover(side, d)
+    if _is_power_hour():
+        checks.append(('Power-hour mover', power_mover))
+
+    # Require score + trigger, then at least two supporting confirmations.
+    # A genuine power-hour acceleration counts as an additional supporting check.
+    supporting = sum(bool(x) for x in (directional_candle, hold_ok, rejection, volume_ok, power_mover))
     confirmed = bool(score_ok and trigger_ok and supporting >= 2)
 
     passed = [name for name, ok in checks if ok]
     missing = [name for name, ok in checks if not ok]
+
     if confirmed:
         text = '✅ PRICE ACTION CONFIRMED | ' + ', '.join(passed)
+        if power_mover:
+            text += ' | ⚡ ' + power_text
     else:
         next_need = ', '.join(missing[:3]) if missing else 'additional confirmation'
         text = '⏳ WAITING | Need: ' + next_need
+        if _is_power_hour() and power_mover:
+            text += ' | ⚡ ' + power_text
 
-    return {'confirmed': confirmed, 'text': text, 'checks': checks, 'volume_ratio': vol_ratio, 'trigger_level': pattern_trigger}
+    return {
+        'confirmed': confirmed,
+        'text': text,
+        'checks': checks,
+        'volume_ratio': vol_ratio,
+        'trigger_level': pattern_trigger,
+        'power_hour': _is_power_hour(),
+        'power_hour_mover': power_mover,
+        'power_hour_text': power_text,
+    }
