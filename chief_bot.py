@@ -70,7 +70,13 @@ def normalize(df):
                 if c.lower().endswith(target):
                     df[target] = df[c]
                     break
-    return df[['open', 'high', 'low', 'close', 'volume']].astype(float).dropna()
+    keep = ['open', 'high', 'low', 'close', 'volume']
+    if 'time_key' in df.columns:
+        keep = ['time_key'] + keep
+    out = df[keep].copy()
+    for c in ('open', 'high', 'low', 'close', 'volume'):
+        out[c] = pd.to_numeric(out[c], errors='coerce')
+    return out.dropna(subset=['open', 'high', 'low', 'close', 'volume'])
 
 
 def metrics(df):
@@ -92,7 +98,54 @@ def metrics(df):
     }
 
 
-def score_setup(side, entry_m, higher_m, daily, patterns, momentum, spread_pct=999.0, trade_type='DAY TRADE'):
+def ema8_vwap_3m(df):
+    """Return 3-minute EMA8/VWAP state and whether a fresh cross occurred."""
+    if df is None or len(df) < 12:
+        return {'bull_cross': False, 'bear_cross': False, 'bull_aligned': False, 'bear_aligned': False,
+                'ema8': 0.0, 'vwap': 0.0, 'text': '3m EMA8/VWAP unavailable'}
+
+    d = df.copy()
+    if 'time_key' in d.columns:
+        dt = pd.to_datetime(d['time_key'], errors='coerce')
+        valid = dt.notna()
+        if valid.any():
+            last_date = dt[valid].dt.date.iloc[-1]
+            same_day = dt.dt.date == last_date
+            if same_day.sum() >= 8:
+                d = d.loc[same_day].copy()
+
+    e8 = ema(d['close'], 8)
+    typical = (d['high'] + d['low'] + d['close']) / 3.0
+    vol = d['volume'].clip(lower=0)
+    cum_vol = vol.cumsum().replace(0, pd.NA)
+    vwap = (typical * vol).cumsum() / cum_vol
+    vwap = vwap.ffill().bfill()
+
+    if len(d) < 2 or vwap.isna().all():
+        return {'bull_cross': False, 'bear_cross': False, 'bull_aligned': False, 'bear_aligned': False,
+                'ema8': float(e8.iloc[-1]), 'vwap': 0.0, 'text': '3m EMA8/VWAP unavailable'}
+
+    # Fresh cross means it happened on one of the last three completed 3m bars.
+    bull_series = (e8 > vwap) & (e8.shift(1) <= vwap.shift(1))
+    bear_series = (e8 < vwap) & (e8.shift(1) >= vwap.shift(1))
+    bull_cross = bool(bull_series.tail(3).fillna(False).any())
+    bear_cross = bool(bear_series.tail(3).fillna(False).any())
+    bull_aligned = bool(e8.iloc[-1] > vwap.iloc[-1] and d['close'].iloc[-1] > vwap.iloc[-1])
+    bear_aligned = bool(e8.iloc[-1] < vwap.iloc[-1] and d['close'].iloc[-1] < vwap.iloc[-1])
+
+    state = 'BULL CROSS' if bull_cross else 'BEAR CROSS' if bear_cross else 'BULLISH' if bull_aligned else 'BEARISH' if bear_aligned else 'NEUTRAL'
+    return {
+        'bull_cross': bull_cross,
+        'bear_cross': bear_cross,
+        'bull_aligned': bull_aligned,
+        'bear_aligned': bear_aligned,
+        'ema8': float(e8.iloc[-1]),
+        'vwap': float(vwap.iloc[-1]),
+        'text': f"3m EMA8/VWAP: {state} | EMA8 {e8.iloc[-1]:.2f} | VWAP {vwap.iloc[-1]:.2f}",
+    }
+
+
+def score_setup(side, entry_m, higher_m, daily, patterns, momentum, micro3, spread_pct=999.0, trade_type='DAY TRADE'):
     score = 0.0
     reasons = []
     aligned = (
@@ -129,6 +182,16 @@ def score_setup(side, entry_m, higher_m, daily, patterns, momentum, spread_pct=9
         score += mom_points
         reasons.append(mom_reason)
 
+    # 3-minute EMA8/VWAP is a strong timing confirmation for day trades and useful context for swings.
+    cross_ok = micro3['bull_cross'] if side == 'CALL' else micro3['bear_cross']
+    micro_aligned = micro3['bull_aligned'] if side == 'CALL' else micro3['bear_aligned']
+    if cross_ok:
+        score += 1.3 if trade_type == 'DAY TRADE' else 0.6
+        reasons.append('3m EMA8/VWAP fresh cross')
+    elif micro_aligned:
+        score += 0.6 if trade_type == 'DAY TRADE' else 0.3
+        reasons.append('3m EMA8/VWAP aligned')
+
     if spread_pct <= MAX_SPREAD_PCT:
         score += 1.0
         reasons.append(f'spread {spread_pct:.2f}%')
@@ -139,27 +202,21 @@ def score_setup(side, entry_m, higher_m, daily, patterns, momentum, spread_pct=9
     return min(round(score, 1), 10.0), reasons, (matching[0] if matching else None)
 
 
-def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, news, options, confirmation, trade_type):
+def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, micro3, news, options, confirmation, trade_type):
     atr_note = 'Pattern-based invalidation' if pat and pat.invalidation else 'Use confirmed structure invalidation'
     trigger = f"{pat.trigger:.2f}" if pat and pat.trigger else f"{price:.2f} confirmation"
     invalid = f"{pat.invalidation:.2f}" if pat and pat.invalidation else atr_note
-
-    if status == 'CONFIRMED':
-        icon = '✅'
-        status_text = 'CONFIRMED — PRICE ACTION VALIDATED'
-        options_text = options['text']
-    else:
-        icon = '⏳'
-        status_text = 'WAITING FOR PRICE-ACTION CONFIRMATION...'
-        options_text = '⏳ Options: Chief will select contracts after price action confirms.'
-
-    timeframe_text = '15m execution / 1H + Daily bias' if trade_type == 'DAY TRADE' else '1H execution / Daily swing bias'
+    icon = '✅' if status == 'CONFIRMED' else '⏳'
+    status_text = 'CONFIRMED — PRICE ACTION VALIDATED' if status == 'CONFIRMED' else 'WAITING FOR PRICE-ACTION CONFIRMATION...'
+    options_text = options['text'] if status == 'CONFIRMED' else '⏳ Options: Chief will select contracts after price action confirms.'
+    timeframe_text = '15m execution / 3m timing / 1H + Daily bias' if trade_type == 'DAY TRADE' else '1H execution / Daily swing bias / 3m timing context'
 
     return (
         f"{icon} CHIEF {status} {side} | {ticker} | {trade_type}\n"
         f"Score: {score}/10\nPrice: {price:.2f}\n"
         f"Style: {trade_type} | {timeframe_text}\n"
         f"Momentum: {momentum['text']}\n"
+        f"3m Timing: {micro3['text']}\n"
         f"Spread: {spread_pct:.2f}%\n"
         f"Pattern: {pat.name if pat else 'No A+ pattern yet'}\n"
         f"Trigger: {trigger}\nInvalidation: {invalid}\n"
@@ -173,10 +230,7 @@ def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, m
 
 def moomoo_context():
     from moomoo import OpenQuoteContext
-    return OpenQuoteContext(
-        host=os.getenv('MOOMOO_HOST', '127.0.0.1'),
-        port=int(os.getenv('MOOMOO_PORT', '11111')),
-    )
+    return OpenQuoteContext(host=os.getenv('MOOMOO_HOST', '127.0.0.1'), port=int(os.getenv('MOOMOO_PORT', '11111')))
 
 
 def _truthy_series(series):
@@ -241,13 +295,11 @@ def _snapshot_resilient(ctx, batch, depth=0):
 
 
 def get_snapshots(ctx, codes):
-    frames = []
-    skipped = []
+    frames, skipped = [], []
     batches = (len(codes) + SNAPSHOT_BATCH - 1) // SNAPSHOT_BATCH
     for i in range(0, len(codes), SNAPSHOT_BATCH):
         batch_no = i // SNAPSHOT_BATCH + 1
-        batch = codes[i:i + SNAPSHOT_BATCH]
-        got, bad = _snapshot_resilient(ctx, batch)
+        got, bad = _snapshot_resilient(ctx, codes[i:i + SNAPSHOT_BATCH])
         frames.extend(got)
         skipped.extend(bad)
         if batch_no == 1 or batch_no % 5 == 0 or batch_no == batches:
@@ -277,8 +329,7 @@ def rank_market_candidates(snapshot):
     d['spread_pct'] = ((d.ask_price - d.bid_price) / mid.replace(0, pd.NA) * 100.0).fillna(999.0)
     d['liquidity_score'] = d.turnover.clip(lower=1).map(lambda x: math.log10(x))
     d['volume_ratio_score'] = d.volume_ratio.clip(lower=0, upper=5)
-    d['market_rank'] = (d.move_pct.clip(upper=15) * 1.8 + d.volume_ratio_score * 1.6 +
-                        d.liquidity_score * 0.9 - d.spread_pct.clip(upper=5) * 2.0)
+    d['market_rank'] = (d.move_pct.clip(upper=15) * 1.8 + d.volume_ratio_score * 1.6 + d.liquidity_score * 0.9 - d.spread_pct.clip(upper=5) * 2.0)
     d = d.sort_values(['market_rank', 'turnover'], ascending=[False, False])
     return d.head(DEEP_CANDIDATES)['code'].astype(str).tolist()
 
@@ -297,8 +348,7 @@ def build_deep_scan_list(ctx):
             combined.append(code)
         if len(combined) >= DEEP_CANDIDATES:
             break
-    names = ', '.join(c.replace('US.', '') for c in combined)
-    print(f'CHIEF stage 2: {len(combined)} deep candidates -> {names}', flush=True)
+    print(f"CHIEF stage 2: {len(combined)} deep candidates -> {', '.join(c.replace('US.', '') for c in combined)}", flush=True)
     return combined
 
 
@@ -318,7 +368,12 @@ def snapshot_for_code(ctx, code):
 
 def get_bars(ctx, code, ktype, count=300):
     from moomoo import RET_OK, SubType, KLType
-    subtype = {KLType.K_15M: SubType.K_15M, KLType.K_60M: SubType.K_60M, KLType.K_DAY: SubType.K_DAY}[ktype]
+    subtype = {
+        KLType.K_3M: SubType.K_3M,
+        KLType.K_15M: SubType.K_15M,
+        KLType.K_60M: SubType.K_60M,
+        KLType.K_DAY: SubType.K_DAY,
+    }[ktype]
     ret, err = ctx.subscribe([code], [subtype], subscribe_push=False)
     if ret != RET_OK:
         raise RuntimeError(f'subscribe failed {code} {ktype}: {err}')
@@ -332,55 +387,40 @@ def release_removed_candidates(ctx, removed):
     if not removed:
         return
     from moomoo import RET_OK, SubType
-    subtypes = [SubType.K_15M, SubType.K_60M, SubType.K_DAY]
+    subtypes = [SubType.K_3M, SubType.K_15M, SubType.K_60M, SubType.K_DAY]
     for code in removed:
         ret, err = ctx.unsubscribe([code], subtypes)
         if ret != RET_OK:
             print(f'unsubscribe warning {code}: {err}', flush=True)
 
 
-def evaluate_trade_mode(ctx, ticker, side, trade_type, price, spread_pct, d15, d60, dd, m15, m60, daily, last_alert):
+def evaluate_trade_mode(ctx, ticker, side, trade_type, price, spread_pct, d3, d15, d60, dd, m15, m60, daily, last_alert):
+    micro3 = ema8_vwap_3m(d3)
     if trade_type == 'DAY TRADE':
-        entry_df = d15
-        entry_m = m15
-        higher_m = m60
+        entry_df, entry_m, higher_m = d15, m15, m60
         patterns = detect_patterns(d15)
         momentum = momentum_snapshot(d15)
     else:
-        entry_df = d60
-        entry_m = m60
-        higher_m = daily
+        entry_df, entry_m, higher_m = d60, m60, daily
         patterns = detect_patterns(d60)
         momentum = momentum_snapshot(d60)
 
-    score, reasons, pat = score_setup(
-        side, entry_m, higher_m, daily, patterns, momentum, spread_pct, trade_type
-    )
+    score, reasons, pat = score_setup(side, entry_m, higher_m, daily, patterns, momentum, micro3, spread_pct, trade_type)
     if score < WATCH_SCORE:
         return
 
-    confirmation = evaluate_confirmation(
-        side=side,
-        df=entry_df,
-        score=score,
-        pattern=pat,
-        min_score=CONFIRMED_SCORE,
-    )
-    status = 'CONFIRMED' if confirmation['confirmed'] else 'WATCH'
+    confirmation = evaluate_confirmation(side=side, df=entry_df, score=score, pattern=pat, min_score=CONFIRMED_SCORE)
+    if not confirmation['confirmed']:
+        return  # Chief only sends confirmed signals.
+
+    status = 'CONFIRMED'
     key = (ticker, side, trade_type, status, pat.name if pat else '')
     if time.time() - last_alert.get(key, 0) <= 1800:
         return
 
     news = news_context(ctx, ticker)
-    options = (
-        recommend_options(ctx, ticker, side, trade_type=trade_type)
-        if status == 'CONFIRMED'
-        else {'ok': False, 'text': '', 'picks': []}
-    )
-    notify(format_alert(
-        ticker, side, score, status, price, pat, reasons,
-        spread_pct, momentum, news, options, confirmation, trade_type,
-    ))
+    options = recommend_options(ctx, ticker, side, trade_type=trade_type)
+    notify(format_alert(ticker, side, score, status, price, pat, reasons, spread_pct, momentum, micro3, news, options, confirmation, trade_type))
     last_alert[key] = time.time()
 
 
@@ -390,10 +430,7 @@ def run():
     last_alert = {}
     candidates = []
     last_universe_refresh = 0.0
-    notify(
-        'Chief Bot started. Whole-market scanner connected to live Moomoo data. '
-        'DAY TRADE + SWING engines, momentum, news, options and price-action confirmation enabled.'
-    )
+    notify('Chief Bot started. Whole-market scanner connected to live Moomoo data. DAY TRADE + SWING engines, 3m EMA8/VWAP timing, momentum, news, options and price-action confirmation enabled.')
 
     try:
         while True:
@@ -416,6 +453,7 @@ def run():
             for code in candidates:
                 ticker = code.replace('US.', '')
                 try:
+                    d3 = get_bars(ctx, code, KLType.K_3M)
                     d15 = get_bars(ctx, code, KLType.K_15M)
                     d60 = get_bars(ctx, code, KLType.K_60M)
                     dd = get_bars(ctx, code, KLType.K_DAY)
@@ -426,15 +464,9 @@ def run():
                     m15, m60, daily = metrics(d15), metrics(d60), metrics(dd)
                     for side in ('CALL', 'PUT'):
                         if DAY_TRADING:
-                            evaluate_trade_mode(
-                                ctx, ticker, side, 'DAY TRADE', price, spread_pct,
-                                d15, d60, dd, m15, m60, daily, last_alert,
-                            )
+                            evaluate_trade_mode(ctx, ticker, side, 'DAY TRADE', price, spread_pct, d3, d15, d60, dd, m15, m60, daily, last_alert)
                         if SWING_TRADING:
-                            evaluate_trade_mode(
-                                ctx, ticker, side, 'SWING', price, spread_pct,
-                                d15, d60, dd, m15, m60, daily, last_alert,
-                            )
+                            evaluate_trade_mode(ctx, ticker, side, 'SWING', price, spread_pct, d3, d15, d60, dd, m15, m60, daily, last_alert)
                 except Exception as e:
                     print(f'{ticker}: {e}', flush=True)
 
