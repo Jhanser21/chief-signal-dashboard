@@ -1,0 +1,11 @@
+[Unit]
+Description=Check GitHub for Chief Signal Bot updates every minute
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+Persistent=true
+Unit=chief-auto-update.service
+
+[Install]
+WantedBy=timers.target
