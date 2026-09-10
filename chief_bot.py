@@ -1,6 +1,7 @@
 import os
 import time
 import math
+import re
 import requests
 import pandas as pd
 from dotenv import load_dotenv
@@ -8,14 +9,12 @@ from chief_patterns import detect_patterns
 
 load_dotenv('.env')
 
-# ---- Chief runtime settings ----
 WATCH_SCORE = float(os.getenv('WATCH_SCORE', '7.0'))
 CONFIRMED_SCORE = float(os.getenv('CONFIRMED_SCORE', '8.5'))
 MAX_SPREAD_PCT = float(os.getenv('MAX_SPREAD_PCT', '0.40'))
 MIN_RVOL = float(os.getenv('MIN_RVOL', '1.25'))
 SCAN_SECONDS = int(os.getenv('SCAN_SECONDS', '60'))
 
-# Whole-market stage 1 -> stage 2 settings.
 WHOLE_MARKET = os.getenv('WHOLE_MARKET', 'true').lower() in ('1', 'true', 'yes', 'on')
 DEEP_CANDIDATES = int(os.getenv('DEEP_CANDIDATES', '24'))
 UNIVERSE_REFRESH_SECONDS = int(os.getenv('UNIVERSE_REFRESH_SECONDS', '900'))
@@ -25,7 +24,6 @@ MIN_TURNOVER = float(os.getenv('MIN_TURNOVER', '5000000'))
 MIN_VOLUME = float(os.getenv('MIN_VOLUME', '300000'))
 SNAPSHOT_BATCH = min(int(os.getenv('SNAPSHOT_BATCH', '400')), 400)
 
-# These symbols are always kept in the deep scan in addition to the broad-market ranking.
 CORE_WATCHLIST = [x.strip().upper() for x in os.getenv(
     'WATCHLIST', 'QQQ,SPY,NVDA,TSLA,AMD,AMZN,META,GOOGL,AAPL,MSFT,AVGO,ARM,COIN,HIMS'
 ).split(',') if x.strip()]
@@ -60,8 +58,7 @@ def ema(s, n):
 
 
 def normalize(df):
-    ren = {c: c.lower() for c in df.columns}
-    df = df.rename(columns=ren)
+    df = df.rename(columns={c: c.lower() for c in df.columns})
     for target in ('open', 'high', 'low', 'close', 'volume'):
         if target not in df.columns:
             for c in df.columns:
@@ -74,61 +71,44 @@ def normalize(df):
 def metrics(df):
     if len(df) < 55:
         raise RuntimeError('not enough candles')
-    d = df.copy()
-    c = d.close
+    c = df.close
     e20 = ema(c, 20)
     e50 = ema(c, 50)
-    prior_vol = d.volume.tail(21).iloc[:-1].mean()
-    rvol = float(d.volume.iloc[-1] / max(prior_vol, 1))
+    prior_vol = df.volume.tail(21).iloc[:-1].mean()
+    rvol = float(df.volume.iloc[-1] / max(prior_vol, 1))
     bull = e20.iloc[-1] > e50.iloc[-1] and e20.iloc[-1] > e20.iloc[-5] and e50.iloc[-1] > e50.iloc[-5]
     bear = e20.iloc[-1] < e50.iloc[-1] and e20.iloc[-1] < e20.iloc[-5] and e50.iloc[-1] < e50.iloc[-5]
-    return {
-        'bull': bool(bull),
-        'bear': bool(bear),
-        'rvol': rvol,
-        'e20': float(e20.iloc[-1]),
-        'e50': float(e50.iloc[-1]),
-    }
+    return {'bull': bool(bull), 'bear': bool(bear), 'rvol': rvol,
+            'e20': float(e20.iloc[-1]), 'e50': float(e50.iloc[-1])}
 
 
 def score_setup(side, m15, m60, daily, patterns, spread_pct=999.0):
     score = 0.0
     reasons = []
-
-    aligned = (
-        (side == 'CALL' and m60['bull'] and daily['bull']) or
-        (side == 'PUT' and m60['bear'] and daily['bear'])
-    )
+    aligned = ((side == 'CALL' and m60['bull'] and daily['bull']) or
+               (side == 'PUT' and m60['bear'] and daily['bear']))
     if aligned:
         score += 2.5
         reasons.append('HTF trend aligned')
     elif (side == 'CALL' and m60['bull']) or (side == 'PUT' and m60['bear']):
         score += 1.2
         reasons.append('1H trend aligned')
-
     if m15['rvol'] >= MIN_RVOL:
         score += 1.5
         reasons.append(f"RVOL {m15['rvol']:.2f}x")
-
     matching = [p for p in patterns if p.side == side]
     if matching:
         p = matching[0]
         score += min(2.2, 1.0 + p.confidence * 1.4)
         reasons.append(p.name)
-
-    ema_ok = (
-        (side == 'CALL' and m15['e20'] > m15['e50']) or
-        (side == 'PUT' and m15['e20'] < m15['e50'])
-    )
+    ema_ok = ((side == 'CALL' and m15['e20'] > m15['e50']) or
+              (side == 'PUT' and m15['e20'] < m15['e50']))
     if ema_ok:
         score += 1.3
         reasons.append('20/50 EMA structure')
-
     if spread_pct <= MAX_SPREAD_PCT:
         score += 1.0
         reasons.append(f'spread {spread_pct:.2f}%')
-
-    # 1.5 points remain reserved for the upcoming live breakout/retest/liquidity module.
     return min(round(score, 1), 10.0), reasons, (matching[0] if matching else None)
 
 
@@ -137,24 +117,17 @@ def format_alert(ticker, side, score, status, price, pat, reasons, spread_pct):
     trigger = f"{pat.trigger:.2f}" if pat and pat.trigger else f"{price:.2f} confirmation"
     invalid = f"{pat.invalidation:.2f}" if pat and pat.invalidation else atr_note
     return (
-        f"CHIEF {status} {side} | {ticker}\n"
-        f"Score: {score}/10\n"
-        f"Price: {price:.2f}\n"
-        f"Spread: {spread_pct:.2f}%\n"
-        f"Pattern: {pat.name if pat else 'No A+ pattern yet'}\n"
-        f"Trigger: {trigger}\n"
-        f"Invalidation: {invalid}\n"
-        f"Why: {', '.join(reasons)}\n"
+        f"CHIEF {status} {side} | {ticker}\nScore: {score}/10\nPrice: {price:.2f}\n"
+        f"Spread: {spread_pct:.2f}%\nPattern: {pat.name if pat else 'No A+ pattern yet'}\n"
+        f"Trigger: {trigger}\nInvalidation: {invalid}\nWhy: {', '.join(reasons)}\n"
         f"Status: {'BREAK → HOLD → EXPAND' if status == 'CONFIRMED' else 'WATCHING FOR CONFIRMATION'}"
     )
 
 
 def moomoo_context():
     from moomoo import OpenQuoteContext
-    return OpenQuoteContext(
-        host=os.getenv('MOOMOO_HOST', '127.0.0.1'),
-        port=int(os.getenv('MOOMOO_PORT', '11111')),
-    )
+    return OpenQuoteContext(host=os.getenv('MOOMOO_HOST', '127.0.0.1'),
+                            port=int(os.getenv('MOOMOO_PORT', '11111')))
 
 
 def get_us_stock_universe(ctx):
@@ -164,41 +137,78 @@ def get_us_stock_universe(ctx):
         raise RuntimeError(f'get_stock_basicinfo failed: {data}')
     if data is None or data.empty or 'code' not in data.columns:
         raise RuntimeError('Moomoo returned an empty US stock universe')
-
-    # Moomoo's Market.US static universe includes OTC/Pink-sheet symbols. If even one
-    # unsupported OTC symbol is mixed into a snapshot batch, OpenD can reject the whole
-    # batch when the account has no US OTC quote permission. Keep only NYSE/NASDAQ/AMEX.
-    if 'exchange_type' in data.columns:
-        ex = data['exchange_type'].astype(str).str.upper()
-        main_exchange = (
-            ex.str.contains('US_NYSE', na=False) |
-            ex.str.contains('US_NASDAQ', na=False) |
-            ex.str.contains('US_AMEX', na=False) |
-            ex.isin(['4', '5', '7'])
-        )
-        data = data[main_exchange].copy()
-
     if 'delisting' in data.columns:
         data = data[~data['delisting'].fillna(False).astype(bool)].copy()
     if 'suspension' in data.columns:
         data = data[~data['suspension'].fillna(False).astype(bool)].copy()
-
     codes = data['code'].dropna().astype(str).drop_duplicates().tolist()
-    print(f'CHIEF universe: {len(codes)} NYSE/NASDAQ/AMEX symbols after OTC/delisted filter', flush=True)
+    print(f'CHIEF universe: {len(codes)} active US symbols from Moomoo', flush=True)
     return codes
 
 
-def get_snapshots(ctx, codes):
+def _unsupported_code_from_error(err, batch):
+    text = str(err)
+    # OpenD commonly reports: "US OTC market quote is not available for XYZ."
+    m = re.search(r'not available for\s+([A-Z0-9.\-]+)', text, re.I)
+    if not m:
+        return None
+    raw = m.group(1).rstrip('.,;:').upper()
+    candidates = {raw, f'US.{raw}' if not raw.startswith('US.') else raw}
+    for code in batch:
+        if code.upper() in candidates or code.upper().replace('US.', '') == raw.replace('US.', ''):
+            return code
+    return None
+
+
+def _snapshot_resilient(ctx, batch, depth=0):
     from moomoo import RET_OK
-    frames = []
-    for i in range(0, len(codes), SNAPSHOT_BATCH):
-        batch = codes[i:i + SNAPSHOT_BATCH]
-        ret, data = ctx.get_market_snapshot(batch)
+    if not batch:
+        return [], []
+
+    working = list(batch)
+    skipped = []
+
+    # First remove symbols OpenD explicitly identifies as unsupported, then retry.
+    for _ in range(min(30, len(working))):
+        ret, data = ctx.get_market_snapshot(working)
         if ret == RET_OK and data is not None and not data.empty:
-            frames.append(data)
-        else:
-            print(f'snapshot batch {i // SNAPSHOT_BATCH + 1} failed: {data}', flush=True)
-        time.sleep(0.55)
+            return [data], skipped
+        bad = _unsupported_code_from_error(data, working)
+        if bad:
+            working.remove(bad)
+            skipped.append(bad)
+            if not working:
+                return [], skipped
+            time.sleep(0.08)
+            continue
+        break
+
+    if len(working) == 1:
+        return [], skipped + working
+
+    # Unknown mixed-batch failure: bisect so valid listed symbols are still retained.
+    mid = len(working) // 2
+    left_frames, left_skipped = _snapshot_resilient(ctx, working[:mid], depth + 1)
+    right_frames, right_skipped = _snapshot_resilient(ctx, working[mid:], depth + 1)
+    return left_frames + right_frames, skipped + left_skipped + right_skipped
+
+
+def get_snapshots(ctx, codes):
+    frames = []
+    skipped = []
+    batches = (len(codes) + SNAPSHOT_BATCH - 1) // SNAPSHOT_BATCH
+    for i in range(0, len(codes), SNAPSHOT_BATCH):
+        batch_no = i // SNAPSHOT_BATCH + 1
+        batch = codes[i:i + SNAPSHOT_BATCH]
+        got, bad = _snapshot_resilient(ctx, batch)
+        frames.extend(got)
+        skipped.extend(bad)
+        if batch_no == 1 or batch_no % 5 == 0 or batch_no == batches:
+            rows = sum(len(x) for x in frames)
+            print(f'CHIEF stage 1 progress: batch {batch_no}/{batches}, {rows} quoted, {len(skipped)} unsupported skipped', flush=True)
+        time.sleep(0.35)
+    if skipped:
+        print(f'CHIEF stage 1: skipped {len(set(skipped))} unsupported/unquotable US symbols', flush=True)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
@@ -211,30 +221,18 @@ def rank_market_candidates(snapshot):
         if c not in d.columns:
             d[c] = 0.0
         d[c] = pd.to_numeric(d[c], errors='coerce').fillna(0.0)
-
-    d = d[
-        (d.last_price >= MIN_PRICE) &
-        (d.last_price <= MAX_PRICE) &
-        (d.volume >= MIN_VOLUME) &
-        (d.turnover >= MIN_TURNOVER) &
-        (d.prev_close_price > 0)
-    ].copy()
+    d = d[(d.last_price >= MIN_PRICE) & (d.last_price <= MAX_PRICE) &
+          (d.volume >= MIN_VOLUME) & (d.turnover >= MIN_TURNOVER) &
+          (d.prev_close_price > 0)].copy()
     if d.empty:
         return []
-
     d['move_pct'] = ((d.last_price / d.prev_close_price) - 1.0).abs() * 100.0
     mid = (d.ask_price + d.bid_price) / 2.0
     d['spread_pct'] = ((d.ask_price - d.bid_price) / mid.replace(0, pd.NA) * 100.0).fillna(999.0)
-
     d['liquidity_score'] = d.turnover.clip(lower=1).map(lambda x: math.log10(x))
     d['volume_ratio_score'] = d.volume_ratio.clip(lower=0, upper=5)
-    d['market_rank'] = (
-        d.move_pct.clip(upper=15) * 1.8 +
-        d.volume_ratio_score * 1.6 +
-        d.liquidity_score * 0.9 -
-        d.spread_pct.clip(upper=5) * 2.0
-    )
-
+    d['market_rank'] = (d.move_pct.clip(upper=15) * 1.8 + d.volume_ratio_score * 1.6 +
+                        d.liquidity_score * 0.9 - d.spread_pct.clip(upper=5) * 2.0)
     d = d.sort_values(['market_rank', 'turnover'], ascending=[False, False])
     return d.head(DEEP_CANDIDATES)['code'].astype(str).tolist()
 
@@ -242,20 +240,20 @@ def rank_market_candidates(snapshot):
 def build_deep_scan_list(ctx):
     if not WHOLE_MARKET:
         return [f'US.{x}' for x in CORE_WATCHLIST]
-
     universe = get_us_stock_universe(ctx)
-    print(f'CHIEF stage 1: scanning {len(universe)} US stocks...', flush=True)
+    print(f'CHIEF stage 1: scanning {len(universe)} US symbols...', flush=True)
     snap = get_snapshots(ctx, universe)
+    print(f'CHIEF stage 1: received usable snapshots for {len(snap)} symbols', flush=True)
     ranked = rank_market_candidates(snap)
 
-    pinned = [f'US.{x}' for x in CORE_WATCHLIST]
+    # Ranked market candidates come first. Core names fill any unused slots, so the
+    # broad-market scan can actually surface new names instead of being crowded out.
     combined = []
-    for code in pinned + ranked:
+    for code in ranked + [f'US.{x}' for x in CORE_WATCHLIST]:
         if code not in combined:
             combined.append(code)
         if len(combined) >= DEEP_CANDIDATES:
             break
-
     names = ', '.join(c.replace('US.', '') for c in combined)
     print(f'CHIEF stage 2: {len(combined)} deep candidates -> {names}', flush=True)
     return combined
@@ -277,11 +275,8 @@ def snapshot_for_code(ctx, code):
 
 def get_bars(ctx, code, ktype, count=300):
     from moomoo import RET_OK, SubType, KLType
-    subtype = {
-        KLType.K_15M: SubType.K_15M,
-        KLType.K_60M: SubType.K_60M,
-        KLType.K_DAY: SubType.K_DAY,
-    }[ktype]
+    subtype = {KLType.K_15M: SubType.K_15M, KLType.K_60M: SubType.K_60M,
+               KLType.K_DAY: SubType.K_DAY}[ktype]
     ret, err = ctx.subscribe([code], [subtype], subscribe_push=False)
     if ret != RET_OK:
         raise RuntimeError(f'subscribe failed {code} {ktype}: {err}')
@@ -304,14 +299,11 @@ def release_removed_candidates(ctx, removed):
 
 def run():
     from moomoo import KLType
-
     ctx = moomoo_context()
     last_alert = {}
     candidates = []
     last_universe_refresh = 0.0
-
     notify('Chief Bot started. Whole-market scanner connected to live Moomoo data.')
-
     try:
         while True:
             now = time.time()
@@ -337,13 +329,10 @@ def run():
                     d60 = get_bars(ctx, code, KLType.K_60M)
                     dd = get_bars(ctx, code, KLType.K_DAY)
                     price, spread_pct = snapshot_for_code(ctx, code)
-
                     if spread_pct > MAX_SPREAD_PCT:
                         continue
-
                     patterns = detect_patterns(d15)
                     m15, m60, daily = metrics(d15), metrics(d60), metrics(dd)
-
                     for side in ('CALL', 'PUT'):
                         score, reasons, pat = score_setup(side, m15, m60, daily, patterns, spread_pct)
                         status = 'CONFIRMED' if score >= CONFIRMED_SCORE else ('WATCH' if score >= WATCH_SCORE else None)
@@ -353,7 +342,6 @@ def run():
                             last_alert[key] = time.time()
                 except Exception as e:
                     print(f'{ticker}: {e}', flush=True)
-
             time.sleep(SCAN_SECONDS)
     finally:
         ctx.close()
