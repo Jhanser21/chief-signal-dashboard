@@ -22,9 +22,12 @@ except Exception as _lulu_resend_error:
 
 
 def _is_power_hour():
-    """US equity power hour: 3:00 PM through 4:00 PM New York time on weekdays."""
+    """US late-day mover window: 2:55 PM through 4:00 PM New York time on weekdays."""
     now = datetime.now(ZoneInfo('America/New_York'))
-    return now.weekday() < 5 and now.hour == 15
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return (14 * 60 + 55) <= minutes < (16 * 60)
 
 
 def _power_hour_mover(side, d):
