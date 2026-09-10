@@ -164,7 +164,28 @@ def get_us_stock_universe(ctx):
         raise RuntimeError(f'get_stock_basicinfo failed: {data}')
     if data is None or data.empty or 'code' not in data.columns:
         raise RuntimeError('Moomoo returned an empty US stock universe')
-    return data['code'].dropna().astype(str).drop_duplicates().tolist()
+
+    # Moomoo's Market.US static universe includes OTC/Pink-sheet symbols. If even one
+    # unsupported OTC symbol is mixed into a snapshot batch, OpenD can reject the whole
+    # batch when the account has no US OTC quote permission. Keep only NYSE/NASDAQ/AMEX.
+    if 'exchange_type' in data.columns:
+        ex = data['exchange_type'].astype(str).str.upper()
+        main_exchange = (
+            ex.str.contains('US_NYSE', na=False) |
+            ex.str.contains('US_NASDAQ', na=False) |
+            ex.str.contains('US_AMEX', na=False) |
+            ex.isin(['4', '5', '7'])
+        )
+        data = data[main_exchange].copy()
+
+    if 'delisting' in data.columns:
+        data = data[~data['delisting'].fillna(False).astype(bool)].copy()
+    if 'suspension' in data.columns:
+        data = data[~data['suspension'].fillna(False).astype(bool)].copy()
+
+    codes = data['code'].dropna().astype(str).drop_duplicates().tolist()
+    print(f'CHIEF universe: {len(codes)} NYSE/NASDAQ/AMEX symbols after OTC/delisted filter', flush=True)
+    return codes
 
 
 def get_snapshots(ctx, codes):
@@ -177,7 +198,6 @@ def get_snapshots(ctx, codes):
             frames.append(data)
         else:
             print(f'snapshot batch {i // SNAPSHOT_BATCH + 1} failed: {data}', flush=True)
-        # Moomoo documents a general quote-interface pacing limit; keep this conservative.
         time.sleep(0.55)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
@@ -206,7 +226,6 @@ def rank_market_candidates(snapshot):
     mid = (d.ask_price + d.bid_price) / 2.0
     d['spread_pct'] = ((d.ask_price - d.bid_price) / mid.replace(0, pd.NA) * 100.0).fillna(999.0)
 
-    # Stage-1 ranking favors liquid stocks that are actually moving, with volume expansion and tighter spreads.
     d['liquidity_score'] = d.turnover.clip(lower=1).map(lambda x: math.log10(x))
     d['volume_ratio_score'] = d.volume_ratio.clip(lower=0, upper=5)
     d['market_rank'] = (
@@ -229,7 +248,6 @@ def build_deep_scan_list(ctx):
     snap = get_snapshots(ctx, universe)
     ranked = rank_market_candidates(snap)
 
-    # Keep familiar core symbols when possible, but never exceed the deep-candidate cap.
     pinned = [f'US.{x}' for x in CORE_WATCHLIST]
     combined = []
     for code in pinned + ranked:
@@ -277,7 +295,6 @@ def release_removed_candidates(ctx, removed):
     if not removed:
         return
     from moomoo import RET_OK, SubType
-    # Candidate refresh is 15 minutes by default, safely above Moomoo's one-minute minimum before unsubscribe.
     subtypes = [SubType.K_15M, SubType.K_60M, SubType.K_DAY]
     for code in removed:
         ret, err = ctx.unsubscribe([code], subtypes)
@@ -321,7 +338,6 @@ def run():
                     dd = get_bars(ctx, code, KLType.K_DAY)
                     price, spread_pct = snapshot_for_code(ctx, code)
 
-                    # Reject poor stock liquidity before spending signal score on it.
                     if spread_pct > MAX_SPREAD_PCT:
                         continue
 
