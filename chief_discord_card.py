@@ -1,6 +1,7 @@
 import io
 import json
 import re
+import textwrap
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -24,19 +25,17 @@ def _parse_signal(msg):
 
     first = lines[0]
     status = 'CONFIRMED' if ' CONFIRMED ' in first else 'WATCH'
-    m = re.search(r'CHIEF\s+(?:WATCH|CONFIRMED)\s+(CALL|PUT)\s*\|\s*([^|\s]+)', first)
+    m = re.search(r'CHIEF\s+(?:WATCH|CONFIRMED)\s+(CALL|PUT)\s*\|\s*([^\s]+)', first)
     if not m:
         return None
     side, ticker = m.group(1), m.group(2)
-    parts = [p.strip() for p in first.split('|')]
-    trade_type = parts[2].upper() if len(parts) >= 3 and parts[2].strip() else 'SIGNAL'
 
     fields = {}
     for line in lines[1:]:
         if ':' in line:
             k, v = line.split(':', 1)
             key = k.strip().lower()
-            if key in {'score','price','style','momentum','spread','pattern','trigger','invalidation','confirmation','news','why','status'}:
+            if key in {'score','price','momentum','spread','pattern','trigger','invalidation','confirmation','news','why','status'}:
                 fields[key] = v.strip()
 
     option_lines = []
@@ -54,7 +53,6 @@ def _parse_signal(msg):
         'status': status,
         'side': side,
         'ticker': ticker,
-        'trade_type': trade_type,
         'fields': fields,
         'options': option_lines,
     }
@@ -115,7 +113,6 @@ def render_signal_card(msg):
     status = data['status']
     icon = '✓' if status == 'CONFIRMED' else '⌛'
     accent = green if status == 'CONFIRMED' else amber
-    trade_type = data.get('trade_type', 'SIGNAL')
 
     draw.rounded_rectangle((48, 44, 105, 101), radius=10, fill=(20, 167, 79) if status == 'CONFIRMED' else (184, 125, 18))
     draw.text((63, 48), icon, font=_font(38, True), fill=white)
@@ -123,24 +120,18 @@ def render_signal_card(msg):
     draw.text((340, 44), f"{status} {data['side']}", font=title_font, fill=white)
     draw.text((865, 44), '|', font=title_font, fill=muted)
     draw.text((905, 44), data['ticker'], font=ticker_font, fill=(171, 211, 248))
-
-    badge_x = 1260
-    badge_w = 210 if trade_type == 'SWING' else 250
-    draw.rounded_rectangle((badge_x, 48, badge_x + badge_w, 91), radius=14, fill=(8, 48, 72), outline=cyan, width=2)
-    draw.text((badge_x + 20, 56), trade_type, font=_font(21, True), fill=cyan)
-    draw.text((1540, 51), 'SIGNAL ALERT', font=_font(23, True), fill=muted)
-    draw.text((1455, 90), 'DISCIPLINE  ·  DATA  ·  EXECUTION', font=_font(16, False), fill=(89, 153, 201))
+    draw.text((1490, 51), 'SIGNAL ALERT', font=_font(23, True), fill=muted)
+    draw.text((1425, 90), 'DISCIPLINE  ·  DATA  ·  EXECUTION', font=_font(16, False), fill=(89, 153, 201))
 
     f = data['fields']
     left_x = 55
     value_x = 280
     y = 175
-    row_h = 48
+    row_h = 52
 
     rows = [
         ('SCORE', f.get('score', '—')),
         ('PRICE', f.get('price', '—')),
-        ('STYLE', f.get('style', trade_type)),
         ('MOMENTUM', f.get('momentum', '—')),
         ('SPREAD', f.get('spread', '—')),
         ('PATTERN', f.get('pattern', '—')),
@@ -158,16 +149,14 @@ def render_signal_card(msg):
                 fill = red
             elif 'bull' in low:
                 fill = green
-        if label == 'STYLE':
-            fill = cyan
-        font = body_bold if label in ('SCORE', 'MOMENTUM', 'STYLE') else body_font
+        font = body_bold if label in ('SCORE', 'MOMENTUM') else body_font
         for j, txt in enumerate(_fit_text(draw, value, font, W - value_x - 80, 1)):
             draw.text((value_x, y - 2 + j * 30), txt, font=font, fill=fill)
         y += row_h
 
     sep_y = y + 4
     draw.line((45, sep_y, W - 45, sep_y), fill=(21, 92, 119), width=2)
-    y = sep_y + 26
+    y = sep_y + 30
 
     detail_rows = [
         ('CONFIRMATION', f.get('confirmation', '—')),
@@ -178,11 +167,10 @@ def render_signal_card(msg):
         draw.text((left_x, y), label, font=label_font, fill=muted)
         draw.line((235, y - 2, 235, y + 31), fill=(28, 116, 153), width=2)
         fill = accent if label == 'CONFIRMATION' else white
-        font = body_bold if label == 'CONFIRMATION' else small_font
-        wrapped = _fit_text(draw, value, font, W - value_x - 65, 2)
+        wrapped = _fit_text(draw, value, small_font if label != 'CONFIRMATION' else body_bold, W - value_x - 65, 2)
         for j, txt in enumerate(wrapped):
-            draw.text((value_x, y - 1 + j * 29), txt, font=font, fill=fill)
-        y += 68 if len(wrapped) > 1 else 52
+            draw.text((value_x, y - 1 + j * 29), txt, font=small_font if label != 'CONFIRMATION' else body_bold, fill=fill)
+        y += 72 if len(wrapped) > 1 else 55
 
     option_lines = data.get('options') or []
     if option_lines and y < H - 170:
@@ -207,7 +195,21 @@ def render_signal_card(msg):
     return out
 
 
+class _SuppressedResponse:
+    status_code = 204
+    text = ''
+
+    def raise_for_status(self):
+        return None
+
+
 def install_discord_card_hook(requests_module):
+    """Send only CONFIRMED Chief trading signals.
+
+    WATCH alerts are suppressed for both Telegram and Discord. Confirmed Discord
+    webhook alerts are rendered as signal cards. Non-signal messages, such as
+    the startup notification, are left untouched.
+    """
     if getattr(requests_module, '_chief_card_hook_installed', False):
         return
 
@@ -216,17 +218,22 @@ def install_discord_card_hook(requests_module):
     def hooked_post(url, *args, **kwargs):
         try:
             payload = kwargs.get('json')
-            msg = payload.get('content', '') if isinstance(payload, dict) else ''
+            msg = ''
+            if isinstance(payload, dict):
+                msg = payload.get('content', '') or payload.get('text', '')
+
+            # Chief may internally identify WATCH setups, but they are no longer
+            # delivered as trading signals. Only price-action-confirmed setups go out.
+            if msg and 'CHIEF WATCH ' in msg:
+                return _SuppressedResponse()
+
             is_discord = 'discord.com/api/webhooks/' in str(url) or 'discordapp.com/api/webhooks/' in str(url)
-            if is_discord and msg and 'CHIEF ' in msg and (' WATCH ' in msg or ' CONFIRMED ' in msg):
+            if is_discord and msg and 'CHIEF CONFIRMED ' in msg:
                 card = render_signal_card(msg)
                 if card is not None:
                     kwargs.pop('json', None)
                     parsed = _parse_signal(msg)
-                    caption = (
-                        f"Chief {parsed['trade_type']} | {parsed['status']} {parsed['side']} | {parsed['ticker']}"
-                        if parsed else 'Chief Signal'
-                    )
+                    caption = f"Chief CONFIRMED {parsed['side']} | {parsed['ticker']}" if parsed else 'Chief Confirmed Signal'
                     kwargs['data'] = {'payload_json': json.dumps({'content': caption})}
                     kwargs['files'] = {'files[0]': ('chief-signal.png', card, 'image/png')}
                     return original_post(url, *args, **kwargs)
