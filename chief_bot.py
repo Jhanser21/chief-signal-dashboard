@@ -23,7 +23,9 @@ SCAN_SECONDS = 25
 DAY_TRADING = os.getenv('DAY_TRADING', 'true').lower() in ('1', 'true', 'yes', 'on')
 SWING_TRADING = os.getenv('SWING_TRADING', 'true').lower() in ('1', 'true', 'yes', 'on')
 WHOLE_MARKET = os.getenv('WHOLE_MARKET', 'true').lower() in ('1', 'true', 'yes', 'on')
-DEEP_CANDIDATES = min(int(os.getenv('DEEP_CANDIDATES', '24')), 16 if DAY_TRADING else 24)
+# Five subscribed timeframes per symbol (3m, 5m, 15m, 1H, Daily).
+# 20 symbols x 5 subscriptions = 100, matching the Moomoo subscription cap.
+DEEP_CANDIDATES = min(int(os.getenv('DEEP_CANDIDATES', '20')), 20)
 UNIVERSE_REFRESH_SECONDS = int(os.getenv('UNIVERSE_REFRESH_SECONDS', '900'))
 MIN_PRICE = float(os.getenv('MIN_PRICE', '5'))
 MAX_PRICE = float(os.getenv('MAX_PRICE', '1000'))
@@ -167,13 +169,11 @@ def score_setup(side, entry_m, higher_m, daily, patterns, momentum, micro3, spre
     return min(round(score, 1), 10.0), reasons, (matching[0] if matching else None)
 
 
-def _pattern_source_tf(pat, p1, p5, p15):
+def _pattern_source_tf(pat, p5, p15):
     if pat is None:
         return ''
     if any(pat is p for p in p5):
         return '5m'
-    if any(pat is p for p in p1):
-        return '1m'
     if any(pat is p for p in p15):
         return '15m'
     return ''
@@ -184,7 +184,7 @@ def format_alert(ticker, side, score, status, price, pat, pattern_tf, reasons, s
     trigger = f"{pat.trigger:.2f}" if pat and pat.trigger else f"{price:.2f} confirmation"
     invalid = f"{pat.invalidation:.2f}" if pat and pat.invalidation else atr_note
     pattern_text = f"{pat.name} ({pattern_tf})" if pat else 'No A+ pattern yet'
-    timeframe_text = '1m + 5m patterns / 3m EMA8-VWAP timing / 15m execution / 1H + Daily bias' if trade_type == 'DAY TRADE' else '1H execution / Daily swing bias / 3m timing context'
+    timeframe_text = '5m patterns / 3m EMA8-VWAP timing / 15m execution / 1H + Daily bias' if trade_type == 'DAY TRADE' else '1H execution / Daily swing bias / 3m timing context'
     return (
         f"✅ CHIEF CONFIRMED {side} | {ticker} | {trade_type}\n"
         f"Score: {score}/10\nPrice: {price:.2f}\n"
@@ -215,7 +215,7 @@ def format_early_setup(ticker, side, score, price, pat, pattern_tf, reasons, spr
 
 
 def high_confidence_early_setup(side, score, pat, pattern_tf, higher_m, daily, micro3, momentum):
-    if score < EARLY_SETUP_SCORE or pat is None or pattern_tf not in ('1m', '5m'):
+    if score < EARLY_SETUP_SCORE or pat is None or pattern_tf != '5m':
         return False
     micro_ok = micro3['bull_aligned'] if side == 'CALL' else micro3['bear_aligned']
     htf_ok = higher_m['bull'] if side == 'CALL' else higher_m['bear']
@@ -363,7 +363,7 @@ def snapshot_for_code(ctx, code):
 
 def get_bars(ctx, code, ktype, count=300):
     from moomoo import RET_OK, SubType, KLType
-    subtype = {KLType.K_1M: SubType.K_1M, KLType.K_3M: SubType.K_3M, KLType.K_5M: SubType.K_5M, KLType.K_15M: SubType.K_15M, KLType.K_60M: SubType.K_60M, KLType.K_DAY: SubType.K_DAY}[ktype]
+    subtype = {KLType.K_3M: SubType.K_3M, KLType.K_5M: SubType.K_5M, KLType.K_15M: SubType.K_15M, KLType.K_60M: SubType.K_60M, KLType.K_DAY: SubType.K_DAY}[ktype]
     ret, err = ctx.subscribe([code], [subtype], subscribe_push=False)
     if ret != RET_OK:
         raise RuntimeError(f'subscribe failed {code} {ktype}: {err}')
@@ -377,22 +377,21 @@ def release_removed_candidates(ctx, removed):
     if not removed:
         return
     from moomoo import RET_OK, SubType
-    subtypes = [SubType.K_1M, SubType.K_3M, SubType.K_5M, SubType.K_15M, SubType.K_60M, SubType.K_DAY]
+    subtypes = [SubType.K_3M, SubType.K_5M, SubType.K_15M, SubType.K_60M, SubType.K_DAY]
     for code in removed:
         ret, err = ctx.unsubscribe([code], subtypes)
         if ret != RET_OK:
             print(f'unsubscribe warning {code}: {err}', flush=True)
 
 
-def evaluate_trade_mode(ctx, ticker, side, trade_type, price, spread_pct, d1, d3, d5, d15, d60, dd, m15, m60, daily, last_alert, swing_send_count):
+def evaluate_trade_mode(ctx, ticker, side, trade_type, price, spread_pct, d3, d5, d15, d60, dd, m15, m60, daily, last_alert, swing_send_count):
     micro3 = ema8_vwap_3m(d3)
-    p1, p5, p15 = [], [], []
+    p5, p15 = [], []
     if trade_type == 'DAY TRADE':
         entry_m, higher_m = m15, m60
-        p1 = detect_patterns(d1)
         p5 = detect_patterns(d5)
         p15 = detect_patterns(d15)
-        patterns = p5 + p1 + p15
+        patterns = p5 + p15
         momentum = momentum_snapshot(d15)
     else:
         entry_m, higher_m = m60, daily
@@ -405,13 +404,10 @@ def evaluate_trade_mode(ctx, ticker, side, trade_type, price, spread_pct, d1, d3
 
     pattern_tf = ''
     if trade_type == 'DAY TRADE':
-        pattern_tf = _pattern_source_tf(pat, p1, p5, p15)
+        pattern_tf = _pattern_source_tf(pat, p5, p15)
         if pattern_tf == '5m':
             entry_df = d5
             reasons.append('5m pattern confirmation')
-        elif pattern_tf == '1m':
-            entry_df = d1
-            reasons.append('1m pattern confirmation')
         else:
             entry_df = d15
             if pat:
@@ -461,7 +457,7 @@ def run():
     swing_send_count = {}
     candidates = []
     last_universe_refresh = 0.0
-    print('Chief Bot started. Signal delivery window: 8:30 AM-4:00 PM ET weekdays. High-confidence DAY TRADE early setups enabled. Swing duplicate signals capped at 2 sends per setup.', flush=True)
+    print('Chief Bot started. 20-stock deep scan using 3m/5m/15m/1H/Daily. 1m feed disabled. Scan delay: 25s. High-confidence DAY TRADE early setups enabled. Swing duplicate signals capped at 2 sends per setup.', flush=True)
     try:
         while True:
             now = time.time()
@@ -483,7 +479,6 @@ def run():
             for code in candidates:
                 ticker = code.replace('US.', '')
                 try:
-                    d1 = get_bars(ctx, code, KLType.K_1M)
                     d3 = get_bars(ctx, code, KLType.K_3M)
                     d5 = get_bars(ctx, code, KLType.K_5M)
                     d15 = get_bars(ctx, code, KLType.K_15M)
@@ -495,9 +490,9 @@ def run():
                     m15, m60, daily = metrics(d15), metrics(d60), metrics(dd)
                     for side in ('CALL', 'PUT'):
                         if DAY_TRADING:
-                            evaluate_trade_mode(ctx, ticker, side, 'DAY TRADE', price, spread_pct, d1, d3, d5, d15, d60, dd, m15, m60, daily, last_alert, swing_send_count)
+                            evaluate_trade_mode(ctx, ticker, side, 'DAY TRADE', price, spread_pct, d3, d5, d15, d60, dd, m15, m60, daily, last_alert, swing_send_count)
                         if SWING_TRADING:
-                            evaluate_trade_mode(ctx, ticker, side, 'SWING', price, spread_pct, d1, d3, d5, d15, d60, dd, m15, m60, daily, last_alert, swing_send_count)
+                            evaluate_trade_mode(ctx, ticker, side, 'SWING', price, spread_pct, d3, d5, d15, d60, dd, m15, m60, daily, last_alert, swing_send_count)
                 except Exception as e:
                     print(f'{ticker}: {e}', flush=True)
             time.sleep(SCAN_SECONDS)
