@@ -384,7 +384,7 @@ def release_removed_candidates(ctx, removed):
             print(f'unsubscribe warning {code}: {err}', flush=True)
 
 
-def evaluate_trade_mode(ctx, ticker, side, trade_type, price, spread_pct, d1, d3, d5, d15, d60, dd, m15, m60, daily, last_alert):
+def evaluate_trade_mode(ctx, ticker, side, trade_type, price, spread_pct, d1, d3, d5, d15, d60, dd, m15, m60, daily, last_alert, swing_send_count):
     micro3 = ema8_vwap_3m(d3)
     p1, p5, p15 = [], [], []
     if trade_type == 'DAY TRADE':
@@ -439,21 +439,29 @@ def evaluate_trade_mode(ctx, ticker, side, trade_type, price, spread_pct, d1, d3
     if time.time() - last_alert.get(key, 0) <= 1800:
         return
 
+    swing_key = (ticker, side, pat.name if pat else 'NO_PATTERN')
+    if trade_type == 'SWING' and swing_send_count.get(swing_key, 0) >= 2:
+        print(f'{ticker} SWING {side}: duplicate swing setup suppressed after 2 sends.', flush=True)
+        return
+
     news = news_context(ctx, ticker)
     options = recommend_options(ctx, ticker, side, trade_type=trade_type)
     if not options.get('ok'):
         print(f"{ticker} {trade_type} {side}: confirmed setup has no valid options contract: {options.get('text', 'option scan failed')}. Sending underlying signal anyway.", flush=True)
     notify(format_alert(ticker, side, score, status, price, pat, pattern_tf, reasons, spread_pct, momentum, micro3, news, options, confirmation, trade_type))
     last_alert[key] = time.time()
+    if trade_type == 'SWING':
+        swing_send_count[swing_key] = swing_send_count.get(swing_key, 0) + 1
 
 
 def run():
     from moomoo import KLType
     ctx = moomoo_context()
     last_alert = {}
+    swing_send_count = {}
     candidates = []
     last_universe_refresh = 0.0
-    print('Chief Bot started. Signal delivery window: 8:30 AM-4:00 PM ET weekdays. High-confidence DAY TRADE early setups enabled.', flush=True)
+    print('Chief Bot started. Signal delivery window: 8:30 AM-4:00 PM ET weekdays. High-confidence DAY TRADE early setups enabled. Swing duplicate signals capped at 2 sends per setup.', flush=True)
     try:
         while True:
             now = time.time()
@@ -487,9 +495,9 @@ def run():
                     m15, m60, daily = metrics(d15), metrics(d60), metrics(dd)
                     for side in ('CALL', 'PUT'):
                         if DAY_TRADING:
-                            evaluate_trade_mode(ctx, ticker, side, 'DAY TRADE', price, spread_pct, d1, d3, d5, d15, d60, dd, m15, m60, daily, last_alert)
+                            evaluate_trade_mode(ctx, ticker, side, 'DAY TRADE', price, spread_pct, d1, d3, d5, d15, d60, dd, m15, m60, daily, last_alert, swing_send_count)
                         if SWING_TRADING:
-                            evaluate_trade_mode(ctx, ticker, side, 'SWING', price, spread_pct, d1, d3, d5, d15, d60, dd, m15, m60, daily, last_alert)
+                            evaluate_trade_mode(ctx, ticker, side, 'SWING', price, spread_pct, d1, d3, d5, d15, d60, dd, m15, m60, daily, last_alert, swing_send_count)
                 except Exception as e:
                     print(f'{ticker}: {e}', flush=True)
             time.sleep(SCAN_SECONDS)
