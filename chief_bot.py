@@ -140,7 +140,7 @@ def day_alert(ticker,side,score,price,pat,tf,reasons,spread,momentum,micro3,news
 
 def swing_alert(ticker,side,price,a,spread,news,options):
     stop=f'{a["stop"]:.2f}' if a.get('stop') is not None else 'N/A'; target=f'{a["target"]:.2f}' if a.get('target') is not None else 'N/A'
-    return (f'✅ CHIEF CONFIRMED {side} | {ticker} | SWING\nScore: {a["score"]}/10 | JR Score {a["raw_score"]}/100 {a["grade"]}\nPrice: {price:.2f}\nStyle: SWING | DAILY execution / Weekly + 4H alignment / RS + volume + structure\nMomentum: Daily structure engine\nSpread: {spread:.2f}%\nPattern: {a["structure"]} (Daily)\nTrigger: {a["confirmation_text"]}\nInvalidation: {stop}\nTarget: {target} (2R structure target)\nConfirmation: {a["confirmation_text"]}\nTrend: Weekly {a["weekly"]} | Daily {a["daily"]} | 4H {a["h4"]}\nRelative Strength: {a["rs_text"]}\nVolume: {a["volume_state"]} | RVOL {a["rvol"]:.2f}x\nBull Score: {a["bull_score"]}/100 | Bear Score: {a["bear_score"]}/100 | Edge: {a["edge"]} pts\nModel Position Tier: {a["position_size_pct"]}% of normal size\nNews: {news["text"]}\nWhy: {", ".join(a["reasons"])}\n\n{options["text"]}\n\nStatus: ✅ CONFIRMED — JR DAILY SWING METRICS VALIDATED')
+    return (f'✅ CHIEF CONFIRMED {side} | {ticker} | SWING\nScore: {a["score"]}/10 | JR Score {a["raw_score"]}/100 {a["grade"]}\nPrice: {price:.2f}\nStyle: SWING | Daily + 4H structure / Weekly alignment / RS + volume\nMomentum: Daily + 4H structure engine\nSpread: {spread:.2f}%\nPattern: {a["structure"]} (Daily)\nTrigger: {a["confirmation_text"]}\nInvalidation: {stop}\nTarget: {target} (2R structure target)\nConfirmation: {a["confirmation_text"]}\nTrend: Weekly {a["weekly"]} | Daily {a["daily"]} | 4H {a["h4"]}\n4H Setup: {a.get("h4_structure","N/A")} | Internal {a.get("h4_internal_trigger")} | Major {a.get("h4_major_trigger")}\nRelative Strength: {a["rs_text"]}\nVolume: {a["volume_state"]} | RVOL {a["rvol"]:.2f}x\nBull Score: {a["bull_score"]}/100 | Bear Score: {a["bear_score"]}/100 | Edge: {a["edge"]} pts\nModel Position Tier: {a["position_size_pct"]}% of normal size\nNews: {news["text"]}\nWhy: {", ".join(a["reasons"])}\n\n{options["text"]}\n\nStatus: ✅ CONFIRMED — JR DAILY SWING METRICS VALIDATED')
 
 
 def moomoo_context():
@@ -350,7 +350,7 @@ def run():
                             evaluate_day(ctx,ticker,side,price,spread,d3,d5,d15,d60,dd,m15,m60,daily,last_alert)
                     except Exception as e:print(f'{ticker} DAY: {e}',flush=True)
 
-            # Rotating swing pool: only Daily + 1H are needed by JR Swing PRO.
+            # Rotating swing pool: Daily + 1H are pulled; Chief aggregates 1H into dedicated 4H candles and scans 4H structure too.
             if SWING_TRADING and swing_candidates:
                 batch=[]
                 for _ in range(min(SWING_BATCH_SIZE,len(swing_candidates))):
@@ -367,7 +367,7 @@ def run():
                             for side in ('CALL','PUT'):
                                 a=analyze_daily_swing(dd,d60,benchmarks,side)
                                 if a.get('front_run') and not a.get('confirmed'):
-                                    print(f"{ticker} SWING {side}: EARLY {a.get('raw_score',0)}/100 | internal {a.get('internal_trigger')} -> major {a.get('major_trigger')} | proj RVOL {a.get('projected_rvol',0):.2f}x",flush=True)
+                                    print(f"{ticker} SWING {side}: EARLY {a.get('raw_score',0)}/100 | Daily {a.get('internal_trigger')} -> {a.get('major_trigger')} | 4H {a.get('h4_structure')} {a.get('h4_internal_trigger')} -> {a.get('h4_major_trigger')} | proj RVOL {a.get('projected_rvol',0):.2f}x",flush=True)
                                 evaluate_swing(ctx,ticker,side,price,spread,d60,dd,benchmarks,last_alert,swing_send_count)
                     except Exception as e:print(f'{ticker} SWING: {e}',flush=True)
                     finally:
