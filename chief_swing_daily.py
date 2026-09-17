@@ -33,6 +33,35 @@ def _trend(df):
     c=df.close; e8=_ema(c,8); e21=_ema(c,21); e50=_ema(c,50)
     return bool(c.iloc[-1]>e8.iloc[-1]>e21.iloc[-1]>e50.iloc[-1]),bool(c.iloc[-1]<e8.iloc[-1]<e21.iloc[-1]<e50.iloc[-1])
 
+def _scan_h4_structure(h4,side):
+    if h4 is None or len(h4)<25:
+        return {'trend':'Neutral','structure':'Unavailable','internal_trigger':None,'major_trigger':None,'breakout':False,'compression':False}
+    x=h4.copy().reset_index(drop=True)
+    c,h,l,v=x.close,x.high,x.low,x.volume
+    e8,e21,e50=_ema(c,8),_ema(c,21),_ema(c,50)
+    bull=bool(c.iloc[-1]>e8.iloc[-1]>e21.iloc[-1]>e50.iloc[-1])
+    bear=bool(c.iloc[-1]<e8.iloc[-1]<e21.iloc[-1]<e50.iloc[-1])
+    il=min(INTERNAL_LOOKBACK,len(x)-2); ml=min(MAJOR_LOOKBACK,len(x)-2)
+    int_res=float(h.iloc[-il-1:-1].max()); int_sup=float(l.iloc[-il-1:-1].min())
+    maj_res=float(h.iloc[-ml-1:-1].max()); maj_sup=float(l.iloc[-ml-1:-1].min())
+    vol_avg=float(v.tail(min(RVOL_LEN,len(v))).mean())
+    comp_hi=float(h.iloc[-min(COMPRESSION_LEN,len(h)-1)-1:-1].max())
+    comp_lo=float(l.iloc[-min(COMPRESSION_LEN,len(l)-1)-1:-1].min())
+    comp_width=((comp_hi-comp_lo)/comp_lo*100) if comp_lo>0 else 999
+    compression=bool(comp_width<=15 and float(v.iloc[-1])<vol_avg)
+    higher_lows=bool(len(l)>=10 and l.tail(5).min()>l.iloc[-10:-5].min())
+    lower_highs=bool(len(h)>=10 and h.tail(5).max()<h.iloc[-10:-5].max())
+    if side=='CALL':
+        breakout=bool(h.iloc[-1]>int_res and c.iloc[-1]>int_res)
+        major=bool(h.iloc[-1]>maj_res and c.iloc[-1]>maj_res)
+        structure='Major Breakout' if major else 'Internal Break' if breakout else 'Compression' if compression else 'Higher Lows' if higher_lows else 'Trend'
+        return {'trend':'Bullish' if bull else 'Bearish' if bear else 'Neutral','structure':structure,'internal_trigger':int_res,'major_trigger':maj_res,'breakout':breakout,'major_breakout':major,'compression':compression}
+    breakout=bool(l.iloc[-1]<int_sup and c.iloc[-1]<int_sup)
+    major=bool(l.iloc[-1]<maj_sup and c.iloc[-1]<maj_sup)
+    structure='Major Breakdown' if major else 'Internal Break' if breakout else 'Compression' if compression else 'Lower Highs' if lower_highs else 'Trend'
+    return {'trend':'Bearish' if bear else 'Bullish' if bull else 'Neutral','structure':structure,'internal_trigger':int_sup,'major_trigger':maj_sup,'breakout':breakout,'major_breakout':major,'compression':compression}
+
+
 def _rs_state(stock,bench):
     n=min(len(stock),len(bench))
     if n<55:return False,False
@@ -53,6 +82,7 @@ def analyze_daily_swing(dd,d60,benchmarks,side):
     d=dd.copy().reset_index(drop=True); w=_weekly_from_daily(d); h4=_four_hour_from_60m(d60)
     c,h,l,o,v=d.close,d.high,d.low,d.open,d.volume; e8=_ema(c,8); e21=_ema(c,21); e50=_ema(c,50); vol_avg=_sma(v,RVOL_LEN)
     rvol=float(v.iloc[-1]/max(float(vol_avg.iloc[-1]),1.0)); wb,ws=_trend(w); db,ds=_trend(d); hb,hs=_trend(h4)
+    h4_scan=_scan_h4_structure(h4,side)
     br=max(float(h.iloc[-1]-l.iloc[-1]),1e-9); strong_close=c.iloc[-1]>=h.iloc[-1]-br*.30; weak_close=c.iloc[-1]<=l.iloc[-1]+br*.30
     accumulation=bool(c.iloc[-1]>o.iloc[-1] and rvol>=RVOL_STRONG and strong_close); distribution=bool(c.iloc[-1]<o.iloc[-1] and rvol>=RVOL_STRONG and weak_close); dry=bool(v.iloc[-1]<vol_avg.iloc[-1]*.60)
 
@@ -94,4 +124,4 @@ def analyze_daily_swing(dd,d60,benchmarks,side):
     grade='A+' if raw>=90 else 'A' if raw>=80 else 'B' if raw>=70 else 'C' if raw>=60 else 'WAIT'; edge=abs(bull_score-bear_score); price=float(c.iloc[-1]); stop=int_sup if want_bull else int_res; risk=(price-stop) if want_bull else (stop-price); target=(price+2*risk) if want_bull and risk>0 else (price-2*risk) if (not want_bull and risk>0) else None
     rs_text=' / '.join(f"{s}:{'Leader' if rs[s][0] else 'Laggard' if rs[s][1] else 'Mixed'}" for s in ('SPY','QQQ','IWM'))
     vol_state='Accumulation' if accumulation else 'Distribution' if distribution else 'Dry-Up' if dry else 'Normal'
-    return {'ok':True,'confirmed':confirmed,'front_run':early,'raw_score':int(raw),'score':round(raw/10,1),'bull_score':int(bull_score),'bear_score':int(bear_score),'edge':int(edge),'grade':grade,'position_size_pct':100 if raw>=90 else 75 if raw>=80 else 50 if raw>=70 else 25 if raw>=60 else 0,'structure':pattern,'rvol':rvol,'projected_rvol':proj_rvol,'volume_state':vol_state,'rs_text':rs_text,'weekly':'Bullish' if wb else 'Bearish' if ws else 'Neutral','daily':'Bullish' if db else 'Bearish' if ds else 'Neutral','h4':'Bullish' if hb else 'Bearish' if hs else 'Neutral','reasons':reasons,'stop':stop,'target':target,'internal_trigger':int_res if want_bull else int_sup,'major_trigger':maj_res if want_bull else maj_sup,'confirmation_text':('Daily major LONG breakout confirmed' if want_bull else 'Daily major SHORT breakdown confirmed') if confirmed else ('Daily internal LONG front-run trigger' if want_bull else 'Daily internal SHORT front-run trigger') if early else 'Waiting for JR Swing PRO trigger'}
+    return {'ok':True,'confirmed':confirmed,'front_run':early,'raw_score':int(raw),'score':round(raw/10,1),'bull_score':int(bull_score),'bear_score':int(bear_score),'edge':int(edge),'grade':grade,'position_size_pct':100 if raw>=90 else 75 if raw>=80 else 50 if raw>=70 else 25 if raw>=60 else 0,'structure':pattern,'rvol':rvol,'projected_rvol':proj_rvol,'volume_state':vol_state,'rs_text':rs_text,'weekly':'Bullish' if wb else 'Bearish' if ws else 'Neutral','daily':'Bullish' if db else 'Bearish' if ds else 'Neutral','h4':'Bullish' if hb else 'Bearish' if hs else 'Neutral','h4_structure':h4_scan.get('structure'),'h4_internal_trigger':h4_scan.get('internal_trigger'),'h4_major_trigger':h4_scan.get('major_trigger'),'h4_breakout':h4_scan.get('breakout',False),'h4_major_breakout':h4_scan.get('major_breakout',False),'reasons':reasons,'stop':stop,'target':target,'internal_trigger':int_res if want_bull else int_sup,'major_trigger':maj_res if want_bull else maj_sup,'confirmation_text':('Daily major LONG breakout confirmed' if want_bull else 'Daily major SHORT breakdown confirmed') if confirmed else ('Daily internal LONG front-run trigger' if want_bull else 'Daily internal SHORT front-run trigger') if early else 'Waiting for JR Swing PRO trigger'}
