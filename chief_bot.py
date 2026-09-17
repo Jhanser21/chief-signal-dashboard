@@ -24,8 +24,13 @@ SCAN_SECONDS = 25
 DAY_TRADING = os.getenv('DAY_TRADING', 'true').lower() in ('1','true','yes','on')
 SWING_TRADING = os.getenv('SWING_TRADING', 'true').lower() in ('1','true','yes','on')
 WHOLE_MARKET = os.getenv('WHOLE_MARKET', 'true').lower() in ('1','true','yes','on')
-# 19 symbols x 5 normal feeds = 95, plus SPY/QQQ/IWM Daily RS feeds = max 98 subscriptions.
-DEEP_CANDIDATES = min(int(os.getenv('DEEP_CANDIDATES', '19')), 19)
+# Split architecture:
+# - DAY pool keeps 5 live feeds per symbol for fast intraday scans.
+# - SWING pool rotates through Daily + 1H only, then immediately unsubscribes.
+# This lets Chief inspect far more symbols without holding 5 feeds open on every stock.
+DAY_CANDIDATES = min(int(os.getenv('DAY_CANDIDATES', '10')), 12)
+SWING_CANDIDATES = min(int(os.getenv('SWING_CANDIDATES', '100')), 150)
+SWING_BATCH_SIZE = min(int(os.getenv('SWING_BATCH_SIZE', '10')), 20)
 UNIVERSE_REFRESH_SECONDS = int(os.getenv('UNIVERSE_REFRESH_SECONDS', '900'))
 MIN_PRICE = float(os.getenv('MIN_PRICE', '5'))
 MAX_PRICE = float(os.getenv('MAX_PRICE', '1000'))
@@ -189,28 +194,59 @@ def get_snapshots(ctx,codes):
     return pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
 
 
-def rank_market_candidates(snapshot):
-    if snapshot.empty:return []
+def _filtered_market(snapshot):
+    if snapshot.empty:return pd.DataFrame()
     d=snapshot.copy()
     for c in ['last_price','prev_close_price','volume','turnover','volume_ratio','ask_price','bid_price']:
         if c not in d.columns:d[c]=0.0
         d[c]=pd.to_numeric(d[c],errors='coerce').fillna(0.0)
     d=d[(d.last_price>=MIN_PRICE)&(d.last_price<=MAX_PRICE)&(d.volume>=MIN_VOLUME)&(d.turnover>=MIN_TURNOVER)&(d.prev_close_price>0)].copy()
-    if d.empty:return []
-    d['move_pct']=((d.last_price/d.prev_close_price)-1).abs()*100; mid=(d.ask_price+d.bid_price)/2
+    if d.empty:return d
+    d['move_pct']=((d.last_price/d.prev_close_price)-1).abs()*100
+    mid=(d.ask_price+d.bid_price)/2
     d['spread_pct']=((d.ask_price-d.bid_price)/mid.replace(0,pd.NA)*100).fillna(999)
-    d['rank']=d.move_pct.clip(upper=15)*1.8+d.volume_ratio.clip(0,5)*1.6+d.turnover.clip(lower=1).map(math.log10)*.9-d.spread_pct.clip(upper=5)*2
-    return d.sort_values(['rank','turnover'],ascending=[False,False]).head(DEEP_CANDIDATES).code.astype(str).tolist()
+    d['liq']=d.turnover.clip(lower=1).map(math.log10)
+    d['vr']=d.volume_ratio.clip(0,5)
+    return d[d.spread_pct<=MAX_SPREAD_PCT].copy()
 
 
-def build_deep_scan_list(ctx):
-    if not WHOLE_MARKET:return [f'US.{x}' for x in CORE_WATCHLIST[:DEEP_CANDIDATES]]
-    u=get_us_stock_universe(ctx); print(f'CHIEF stage 1: scanning {len(u)} US symbols...',flush=True); ranked=rank_market_candidates(get_snapshots(ctx,u)); out=[]
-    for code in ranked+[f'US.{x}' for x in CORE_WATCHLIST]:
-        if code not in out:out.append(code)
-        if len(out)>=DEEP_CANDIDATES:break
-    print(f"CHIEF stage 2: {len(out)} deep candidates -> {', '.join(c.replace('US.','') for c in out)}",flush=True); return out
+def rank_day_candidates(snapshot):
+    d=_filtered_market(snapshot)
+    if d.empty:return []
+    # Intraday pool favors current movement, RVOL and liquidity.
+    d['day_rank']=d.move_pct.clip(upper=15)*1.9+d.vr*1.8+d.liq*.9-d.spread_pct.clip(upper=5)*2
+    return d.sort_values(['day_rank','turnover'],ascending=[False,False]).head(DAY_CANDIDATES).code.astype(str).tolist()
 
+
+def rank_swing_candidates(snapshot):
+    d=_filtered_market(snapshot)
+    if d.empty:return []
+    # Swing discovery intentionally does NOT rank only today's biggest movers.
+    # It favors liquidity, participation and reasonable spread while penalizing
+    # already-extended daily moves. JR Swing PRO then does the real structure ranking.
+    extension_penalty=(d.move_pct-6.0).clip(lower=0)*0.8
+    d['swing_rank']=d.liq*1.8+d.vr.clip(upper=3)*1.0+d.move_pct.clip(upper=4)*0.25-extension_penalty-d.spread_pct.clip(upper=5)*2
+    core_codes=[f'US.{x}' for x in CORE_WATCHLIST]
+    d['core_bonus']=d.code.astype(str).isin(core_codes).astype(int)*2.0
+    d['swing_rank']+=d.core_bonus
+    return d.sort_values(['swing_rank','turnover'],ascending=[False,False]).head(SWING_CANDIDATES).code.astype(str).tolist()
+
+
+def build_scan_pools(ctx):
+    if not WHOLE_MARKET:
+        base=[f'US.{x}' for x in CORE_WATCHLIST]
+        return base[:DAY_CANDIDATES],base[:SWING_CANDIDATES]
+    u=get_us_stock_universe(ctx)
+    print(f'CHIEF stage 1: scanning {len(u)} US symbols...',flush=True)
+    snap=get_snapshots(ctx,u)
+    day=rank_day_candidates(snap)
+    swing=rank_swing_candidates(snap)
+    for code in [f'US.{x}' for x in CORE_WATCHLIST]:
+        if code not in day and len(day)<DAY_CANDIDATES:day.append(code)
+        if code not in swing and len(swing)<SWING_CANDIDATES:swing.append(code)
+    print(f"CHIEF DAY pool: {len(day)} -> {', '.join(c.replace('US.','') for c in day)}",flush=True)
+    print(f"CHIEF SWING pool: {len(swing)} rotating symbols",flush=True)
+    return day,swing
 
 def snapshot_for_code(ctx,code):
     from moomoo import RET_OK
@@ -230,13 +266,20 @@ def get_bars(ctx,code,ktype,count=300):
     return normalize(data)
 
 
-def release_removed_candidates(ctx,removed):
+def release_removed_day_candidates(ctx,removed):
     if not removed:return
     from moomoo import RET_OK,SubType
     subs=[SubType.K_3M,SubType.K_5M,SubType.K_15M,SubType.K_60M,SubType.K_DAY]
     for code in removed:
         ret,err=ctx.unsubscribe([code],subs)
-        if ret!=RET_OK:print(f'unsubscribe warning {code}: {err}',flush=True)
+        if ret!=RET_OK:print(f'day-pool unsubscribe warning {code}: {err}',flush=True)
+
+
+def release_temporary_swing(ctx,code,day_set):
+    if code in day_set:return
+    from moomoo import RET_OK,SubType
+    ret,err=ctx.unsubscribe([code],[SubType.K_60M,SubType.K_DAY])
+    if ret!=RET_OK:print(f'swing-temp unsubscribe warning {code}: {err}',flush=True)
 
 
 def evaluate_day(ctx,ticker,side,price,spread,d3,d5,d15,d60,dd,m15,m60,daily,last_alert):
@@ -265,37 +308,76 @@ def evaluate_swing(ctx,ticker,side,price,spread,d60,dd,benchmarks,last_alert,swi
 
 def run():
     from moomoo import KLType
-    ctx=moomoo_context(); last_alert={}; swing_send_count={}; candidates=[]; last_refresh=0.0
-    print('Chief Bot started. 1m disabled. 19-stock deep scan. DAY TRADE uses 3m/5m/15m/1H/Daily. SWING now uses JR Swing PRO metrics on Daily with derived Weekly/4H and SPY/QQQ/IWM relative strength. Scan delay: 25s.',flush=True)
+    ctx=moomoo_context()
+    last_alert={}; swing_send_count={}
+    day_candidates=[]; swing_candidates=[]; swing_cursor=0; last_refresh=0.0
+    print(f'Chief Bot started. Split scanner active: up to {DAY_CANDIDATES} fast DAY names every {SCAN_SECONDS}s + up to {SWING_CANDIDATES} rotating JR Swing PRO names in batches of {SWING_BATCH_SIZE}. 1m disabled.',flush=True)
     try:
         while True:
-            now=time.time()
-            if not candidates or now-last_refresh>=UNIVERSE_REFRESH_SECONDS:
-                old=set(candidates)
+            loop_started=time.time()
+            now=loop_started
+            if not day_candidates or not swing_candidates or now-last_refresh>=UNIVERSE_REFRESH_SECONDS:
+                old_day=set(day_candidates)
                 try:
-                    new=build_deep_scan_list(ctx)
-                    if new:candidates=new; last_refresh=now; release_removed_candidates(ctx,old-set(candidates))
+                    new_day,new_swing=build_scan_pools(ctx)
+                    if new_day:day_candidates=new_day
+                    if new_swing:swing_candidates=new_swing
+                    last_refresh=now
+                    release_removed_day_candidates(ctx,old_day-set(day_candidates))
+                    if swing_cursor>=len(swing_candidates):swing_cursor=0
                 except Exception as e:
                     print(f'whole-market refresh error: {e}',flush=True)
-                    if not candidates:candidates=[f'US.{x}' for x in CORE_WATCHLIST[:DEEP_CANDIDATES]]
+                    if not day_candidates:day_candidates=[f'US.{x}' for x in CORE_WATCHLIST[:DAY_CANDIDATES]]
+                    if not swing_candidates:swing_candidates=[f'US.{x}' for x in CORE_WATCHLIST[:SWING_CANDIDATES]]
+
             benchmarks={}
             if SWING_TRADING:
                 for sym in ('SPY','QQQ','IWM'):
                     try:benchmarks[sym]=get_bars(ctx,f'US.{sym}',KLType.K_DAY)
                     except Exception as e:print(f'{sym} RS benchmark error: {e}',flush=True)
-            for code in candidates:
-                ticker=code.replace('US.','')
-                try:
-                    d3=get_bars(ctx,code,KLType.K_3M); d5=get_bars(ctx,code,KLType.K_5M); d15=get_bars(ctx,code,KLType.K_15M); d60=get_bars(ctx,code,KLType.K_60M); dd=get_bars(ctx,code,KLType.K_DAY)
-                    price,spread=snapshot_for_code(ctx,code)
-                    if spread>MAX_SPREAD_PCT:continue
-                    m15,m60,daily=metrics(d15),metrics(d60),metrics(dd)
-                    for side in ('CALL','PUT'):
-                        if DAY_TRADING:evaluate_day(ctx,ticker,side,price,spread,d3,d5,d15,d60,dd,m15,m60,daily,last_alert)
-                        if SWING_TRADING:evaluate_swing(ctx,ticker,side,price,spread,d60,dd,benchmarks,last_alert,swing_send_count)
-                except Exception as e:print(f'{ticker}: {e}',flush=True)
-            time.sleep(SCAN_SECONDS)
-    finally:ctx.close()
+
+            # Fast intraday pool: keep the full 3m/5m/15m/1H/Daily stack live.
+            if DAY_TRADING:
+                for code in day_candidates:
+                    ticker=code.replace('US.','')
+                    try:
+                        d3=get_bars(ctx,code,KLType.K_3M); d5=get_bars(ctx,code,KLType.K_5M); d15=get_bars(ctx,code,KLType.K_15M)
+                        d60=get_bars(ctx,code,KLType.K_60M); dd=get_bars(ctx,code,KLType.K_DAY)
+                        price,spread=snapshot_for_code(ctx,code)
+                        if spread>MAX_SPREAD_PCT:continue
+                        m15,m60,daily=metrics(d15),metrics(d60),metrics(dd)
+                        for side in ('CALL','PUT'):
+                            evaluate_day(ctx,ticker,side,price,spread,d3,d5,d15,d60,dd,m15,m60,daily,last_alert)
+                    except Exception as e:print(f'{ticker} DAY: {e}',flush=True)
+
+            # Rotating swing pool: only Daily + 1H are needed by JR Swing PRO.
+            if SWING_TRADING and swing_candidates:
+                batch=[]
+                for _ in range(min(SWING_BATCH_SIZE,len(swing_candidates))):
+                    batch.append(swing_candidates[swing_cursor%len(swing_candidates)])
+                    swing_cursor=(swing_cursor+1)%len(swing_candidates)
+                day_set=set(day_candidates)
+                print(f"CHIEF SWING batch: {', '.join(x.replace('US.','') for x in batch)}",flush=True)
+                for code in batch:
+                    ticker=code.replace('US.','')
+                    try:
+                        d60=get_bars(ctx,code,KLType.K_60M); dd=get_bars(ctx,code,KLType.K_DAY)
+                        price,spread=snapshot_for_code(ctx,code)
+                        if spread<=MAX_SPREAD_PCT:
+                            for side in ('CALL','PUT'):
+                                a=analyze_daily_swing(dd,d60,benchmarks,side)
+                                if a.get('front_run') and not a.get('confirmed'):
+                                    print(f"{ticker} SWING {side}: EARLY {a.get('raw_score',0)}/100 | internal {a.get('internal_trigger')} -> major {a.get('major_trigger')} | proj RVOL {a.get('projected_rvol',0):.2f}x",flush=True)
+                                evaluate_swing(ctx,ticker,side,price,spread,d60,dd,benchmarks,last_alert,swing_send_count)
+                    except Exception as e:print(f'{ticker} SWING: {e}',flush=True)
+                    finally:
+                        release_temporary_swing(ctx,code,day_set)
+
+            elapsed=time.time()-loop_started
+            sleep_for=max(1.0,SCAN_SECONDS-elapsed)
+            time.sleep(sleep_for)
+    finally:
+        ctx.close()
 
 
 if __name__=='__main__':run()
