@@ -66,6 +66,47 @@ def notify(msg):
     telegram(msg); discord(msg)
 
 
+def send_one_time_swing_test():
+    """Send one clearly labeled Discord-only Swing card after this deployment."""
+    flag='/tmp/chief_swing_4h_test_v1.sent'
+    if os.path.exists(flag):
+        return
+    url=os.getenv('DISCORD_WEBHOOK_URL','')
+    if not url:
+        print('Swing test skipped: DISCORD_WEBHOOK_URL missing',flush=True)
+        return
+    msg=(
+        '✅ CHIEF CONFIRMED CALL | TEST | SWING\n'
+        'Score: 9.1/10 | JR Score 91/100 A+\n'
+        'Price: 250.00\n'
+        'Style: SWING | Daily + 4H structure / Weekly alignment / RS + volume\n'
+        'Momentum: Daily + 4H structure engine\n'
+        'Spread: 0.18%\n'
+        'Pattern: VCP (Daily)\n'
+        'Trigger: TEST major Daily breakout\n'
+        'Invalidation: 238.00\n'
+        'Target: 274.00 (2R structure target)\n'
+        'Confirmation: TEST ONLY — NOT A LIVE TRADE\n'
+        'Trend: Weekly Bullish | Daily Bullish | 4H Bullish\n'
+        '4H Setup: Internal Break | Internal 247.50 | Major 252.00\n'
+        'Relative Strength: SPY:Leader / QQQ:Leader / IWM:Leader\n'
+        'Volume: Accumulation | RVOL 1.72x\n'
+        'Bull Score: 91/100 | Bear Score: 10/100 | Edge: 81 pts\n'
+        'News: TEST DATA\n'
+        'Why: TEST of the new Daily + 4H Swing alert format\n\n'
+        '🎯 RECOMMENDED OPTIONS\n'
+        'TEST CONTRACT ONLY — no live contract selected\n\n'
+        'Status: 🧪 TEST — NOT A LIVE TRADE'
+    )
+    try:
+        discord(msg)
+        with open(flag,'w') as f:
+            f.write(datetime.now(ZoneInfo('America/New_York')).isoformat())
+        print('One-time Discord Swing 4H test sent',flush=True)
+    except Exception as e:
+        print(f'One-time Discord Swing test failed: {e}',flush=True)
+
+
 def ema(s,n): return s.ewm(span=n, adjust=False).mean()
 
 
@@ -312,6 +353,7 @@ def run():
     last_alert={}; swing_send_count={}
     day_candidates=[]; swing_candidates=[]; swing_cursor=0; last_refresh=0.0
     print(f'Chief Bot started. Split scanner active: up to {DAY_CANDIDATES} fast DAY names every {SCAN_SECONDS}s + up to {SWING_CANDIDATES} rotating JR Swing PRO names in batches of {SWING_BATCH_SIZE}. 1m disabled.',flush=True)
+    send_one_time_swing_test()
     try:
         while True:
             loop_started=time.time()
