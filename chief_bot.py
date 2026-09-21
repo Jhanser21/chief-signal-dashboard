@@ -150,11 +150,11 @@ def send_deploy_test_alert():
         commit=subprocess.check_output(['git','rev-parse','--short=12','HEAD'],stderr=subprocess.STDOUT,text=True,timeout=5).strip()
     except Exception:
         commit='unknown'
-    flag=f'/tmp/chief_discord_deploy_test_{commit}.sent'
+    flag=f'/tmp/chief_discord_deploy_test_v2_{commit}.sent'
     if os.path.exists(flag):
         return
     msg=(
-        '🧪 CHIEF DISCORD TEST ALERT\n'
+        '🧪 CHIEF DISCORD TEST ALERT — PUSH V2\n'
         f'VPS Commit: {commit}\n'
         'Scanner: ACTIVE TEST\n'
         'Day Trade: 3m / 5m / 15m / 1H / Daily\n'
