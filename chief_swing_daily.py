@@ -1,6 +1,7 @@
 import pandas as pd
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from chief_swing_playbook import qualify_swing_playbook
 
 EMA_FAST=8; EMA_MID=21; MA_SLOW=50
 RVOL_LEN=20; RVOL_STRONG=1.50
@@ -83,6 +84,7 @@ def analyze_daily_swing(dd,d60,benchmarks,side):
     c,h,l,o,v=d.close,d.high,d.low,d.open,d.volume; e8=_ema(c,8); e21=_ema(c,21); e50=_ema(c,50); vol_avg=_sma(v,RVOL_LEN)
     rvol=float(v.iloc[-1]/max(float(vol_avg.iloc[-1]),1.0)); wb,ws=_trend(w); db,ds=_trend(d); hb,hs=_trend(h4)
     h4_scan=_scan_h4_structure(h4,side)
+    playbook=qualify_swing_playbook(d,d60,side)
     br=max(float(h.iloc[-1]-l.iloc[-1]),1e-9); strong_close=c.iloc[-1]>=h.iloc[-1]-br*.30; weak_close=c.iloc[-1]<=l.iloc[-1]+br*.30
     accumulation=bool(c.iloc[-1]>o.iloc[-1] and rvol>=RVOL_STRONG and strong_close); distribution=bool(c.iloc[-1]<o.iloc[-1] and rvol>=RVOL_STRONG and weak_close); dry=bool(v.iloc[-1]<vol_avg.iloc[-1]*.60)
 
@@ -116,7 +118,11 @@ def analyze_daily_swing(dd,d60,benchmarks,side):
     front_short=bool(ws and (ds or daily_bear_transition) and hs and rs_bear and bear_momentum and bear_score>=FRONT_MIN_SCORE and bear_score>bull_score and bear_struct_ok and int_bear_break and before_major_bear and proj_rvol>=FRONT_PROJ_RVOL and bear_part and not accumulation)
     clean_long=bool(major_bull and wb and db and hb and rs_bull and bull_score>=FRONT_MIN_SCORE and rvol>=RVOL_STRONG); clean_short=bool(major_bear and ws and ds and hs and rs_bear and bear_score>=FRONT_MIN_SCORE and rvol>=RVOL_STRONG)
 
-    want_bull=side=='CALL'; raw=bull_score if want_bull else bear_score; confirmed=clean_long if want_bull else clean_short; early=(front_long and not clean_long) if want_bull else (front_short and not clean_short)
+    want_bull=side=='CALL'; base_raw=bull_score if want_bull else bear_score
+    raw=max(0,min(100,base_raw+playbook.get('score_bonus',0)))
+    # Core JR confirmation remains mandatory; the FiFi playbook can strengthen/penalize quality but cannot manufacture a breakout.
+    confirmed=(clean_long if want_bull else clean_short) and raw>=70
+    early=((front_long and not clean_long) if want_bull else (front_short and not clean_short)) and raw>=70
     pattern=('VCP' if (bull_vcp if want_bull else bear_vcp) else 'Cup & Handle' if (bull_cup if want_bull else bear_cup) else 'Bull Flag' if want_bull and bull_flag else 'Bear Flag' if (not want_bull and bear_flag) else 'Compression' if compression else 'Higher Lows' if want_bull and higher_lows else 'Lower Highs' if (not want_bull and lower_highs) else 'Major Breakout' if want_bull and major_bull else 'Major Breakdown' if (not want_bull and major_bear) else 'Internal Structure')
     reasons=[]
     for cond,name in [(wb if want_bull else ws,'Weekly trend'),(db if want_bull else ds,'Daily trend'),(hb if want_bull else hs,'4H trend'),(rs_bull if want_bull else rs_bear,'Index RS 2/3+'),(accumulation if want_bull else distribution,'Volume confirmation'),(compression,'Compression'),(bull_vcp if want_bull else bear_vcp,'VCP'),(bull_flag if want_bull else bear_flag,'Flag'),(bull_cup if want_bull else bear_cup,'Cup/Handle'),(higher_lows if want_bull else lower_highs,'Structure'),(major_bull if want_bull else major_bear,'Major level break')]:
@@ -124,4 +130,4 @@ def analyze_daily_swing(dd,d60,benchmarks,side):
     grade='A+' if raw>=90 else 'A' if raw>=80 else 'B' if raw>=70 else 'C' if raw>=60 else 'WAIT'; edge=abs(bull_score-bear_score); price=float(c.iloc[-1]); stop=int_sup if want_bull else int_res; risk=(price-stop) if want_bull else (stop-price); target=(price+2*risk) if want_bull and risk>0 else (price-2*risk) if (not want_bull and risk>0) else None
     rs_text=' / '.join(f"{s}:{'Leader' if rs[s][0] else 'Laggard' if rs[s][1] else 'Mixed'}" for s in ('SPY','QQQ','IWM'))
     vol_state='Accumulation' if accumulation else 'Distribution' if distribution else 'Dry-Up' if dry else 'Normal'
-    return {'ok':True,'confirmed':confirmed,'front_run':early,'raw_score':int(raw),'score':round(raw/10,1),'bull_score':int(bull_score),'bear_score':int(bear_score),'edge':int(edge),'grade':grade,'position_size_pct':100 if raw>=90 else 75 if raw>=80 else 50 if raw>=70 else 25 if raw>=60 else 0,'structure':pattern,'rvol':rvol,'projected_rvol':proj_rvol,'volume_state':vol_state,'rs_text':rs_text,'weekly':'Bullish' if wb else 'Bearish' if ws else 'Neutral','daily':'Bullish' if db else 'Bearish' if ds else 'Neutral','h4':'Bullish' if hb else 'Bearish' if hs else 'Neutral','h4_structure':h4_scan.get('structure'),'h4_internal_trigger':h4_scan.get('internal_trigger'),'h4_major_trigger':h4_scan.get('major_trigger'),'h4_breakout':h4_scan.get('breakout',False),'h4_major_breakout':h4_scan.get('major_breakout',False),'reasons':reasons,'stop':stop,'target':target,'internal_trigger':int_res if want_bull else int_sup,'major_trigger':maj_res if want_bull else maj_sup,'confirmation_text':('Daily major LONG breakout confirmed' if want_bull else 'Daily major SHORT breakdown confirmed') if confirmed else ('Daily internal LONG front-run trigger' if want_bull else 'Daily internal SHORT front-run trigger') if early else 'Waiting for JR Swing PRO trigger'}
+    return {'ok':True,'confirmed':confirmed,'front_run':early,'raw_score':int(raw),'score':round(raw/10,1),'bull_score':int(bull_score),'bear_score':int(bear_score),'edge':int(edge),'grade':grade,'position_size_pct':100 if raw>=90 else 75 if raw>=80 else 50 if raw>=70 else 25 if raw>=60 else 0,'structure':pattern,'rvol':rvol,'projected_rvol':proj_rvol,'volume_state':vol_state,'rs_text':rs_text,'weekly':'Bullish' if wb else 'Bearish' if ws else 'Neutral','daily':'Bullish' if db else 'Bearish' if ds else 'Neutral','h4':'Bullish' if hb else 'Bearish' if hs else 'Neutral','h4_structure':h4_scan.get('structure'),'h4_internal_trigger':h4_scan.get('internal_trigger'),'h4_major_trigger':h4_scan.get('major_trigger'),'h4_breakout':h4_scan.get('breakout',False),'h4_major_breakout':h4_scan.get('major_breakout',False),'tqe_models':playbook.get('models',[]),'tqe_flags':playbook.get('flags',[]),'tqe_stage':playbook.get('stage','Unknown'),'tqe_vcp':playbook.get('vcp',False),'tqe_gap_state':playbook.get('gap_state','None'),'tqe_rubber_band':playbook.get('rubber_band','Normal'),'tqe_zscore':playbook.get('zscore',0),'tqe_bonus':playbook.get('score_bonus',0),'reasons':reasons+playbook.get('models',[]),'stop':stop,'target':target,'internal_trigger':int_res if want_bull else int_sup,'major_trigger':maj_res if want_bull else maj_sup,'confirmation_text':('Daily major LONG breakout confirmed' if want_bull else 'Daily major SHORT breakdown confirmed') if confirmed else ('Daily internal LONG front-run trigger' if want_bull else 'Daily internal SHORT front-run trigger') if early else 'Waiting for JR Swing PRO trigger'}
