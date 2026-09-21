@@ -143,6 +143,35 @@ def deployment_health_report():
         print(f'CHIEF deployment health Discord failed: {e}',flush=True)
 
 
+def send_deploy_test_alert():
+    """One-time-per-commit Discord test proving the deployed VPS can send alerts."""
+    import subprocess
+    try:
+        commit=subprocess.check_output(['git','rev-parse','--short=12','HEAD'],stderr=subprocess.STDOUT,text=True,timeout=5).strip()
+    except Exception:
+        commit='unknown'
+    flag=f'/tmp/chief_discord_deploy_test_{commit}.sent'
+    if os.path.exists(flag):
+        return
+    msg=(
+        '🧪 CHIEF DISCORD TEST ALERT\n'
+        f'VPS Commit: {commit}\n'
+        'Scanner: ACTIVE TEST\n'
+        'Day Trade: 3m / 5m / 15m / 1H / Daily\n'
+        'Swing: Weekly / Daily / 4H + JR Swing PRO + FiFi TQE\n'
+        'Swing Pool: up to 100 rotating stocks\n'
+        'Scan Target: 25 seconds\n'
+        'Status: ✅ DISCORD DELIVERY TEST SUCCESSFUL\n'
+        '⚠️ TEST ONLY — NOT A LIVE TRADE SIGNAL'
+    )
+    try:
+        discord(msg)
+        with open(flag,'w') as f:f.write(commit)
+        print(f'CHIEF Discord deploy test sent: {commit}',flush=True)
+    except Exception as e:
+        print(f'CHIEF Discord deploy test failed: {e}',flush=True)
+
+
 def ema(s,n): return s.ewm(span=n, adjust=False).mean()
 
 
@@ -390,6 +419,7 @@ def run():
     day_candidates=[]; swing_candidates=[]; swing_cursor=0; last_refresh=0.0
     print(f'Chief Bot started. Split scanner active: up to {DAY_CANDIDATES} fast DAY names every {SCAN_SECONDS}s + up to {SWING_CANDIDATES} rotating JR Swing PRO names in batches of {SWING_BATCH_SIZE}. 1m disabled.',flush=True)
     deployment_health_report()
+    send_deploy_test_alert()
     send_one_time_swing_test()
     try:
         while True:
