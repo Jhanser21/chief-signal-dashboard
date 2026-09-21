@@ -69,43 +69,75 @@ def _fit(draw,text,font,max_width,max_lines=2):
 def render_signal_card(msg):
     data=_parse_signal(msg)
     if not data:return None
-    W,H=1800,1040; img=Image.new('RGB',(W,H),(3,17,31)); d=ImageDraw.Draw(img)
-    cyan=(83,226,255); white=(241,246,252); muted=(145,180,212); green=(104,244,162); red=(255,92,106); amber=(255,202,73)
-    early=data['early']; status=data['status']; accent=amber if early or status=='WATCH' else green
-    d.rounded_rectangle((14,14,W-14,H-14),radius=28,fill=(4,23,42),outline=accent if early else cyan,width=3)
-    d.rounded_rectangle((26,26,W-26,H-26),radius=23,outline=(11,83,112),width=1); d.line((45,145,W-45,145),fill=(16,88,117),width=2)
-    tf=_font(47,True); lf=_font(23,True); bf=_font(27); bb=_font(27,True); sf=_font(22)
-    if early:icon='!'; title='EARLY SETUP'; fill=(184,125,18)
-    elif status=='CONFIRMED':icon='✓'; title=f"CONFIRMED {data['side']}"; fill=(20,167,79)
-    else:icon='⌛'; title=f"WATCH {data['side']}"; fill=(184,125,18)
-    d.rounded_rectangle((48,44,105,101),radius=10,fill=fill); d.text((65,49),icon,font=_font(34,True),fill=white)
-    d.text((130,44),'CHIEF',font=tf,fill=cyan); d.text((340,44),title,font=tf,fill=amber if early else white); d.text((865,44),'|',font=tf,fill=muted); d.text((905,44),data['ticker'],font=_font(45,True),fill=(171,211,248))
-    badge=data['trade_type']; bw=250 if badge=='DAY TRADE' else 180; d.rounded_rectangle((1180,48,1180+bw,98),radius=14,fill=(9,60,83),outline=accent if early else cyan,width=2); d.text((1202,58),badge,font=_font(24,True),fill=accent if early else cyan)
-    d.text((1490,51),'SETUP ALERT' if early else 'SIGNAL ALERT',font=_font(23,True),fill=muted); d.text((1425,90),'DISCIPLINE  ·  DATA  ·  EXECUTION',font=_font(16),fill=(89,153,201))
-    f=data['fields']; y=175; lx=55; vx=280; rh=52
-    rows=[('STYLE',badge)]
-    if early:rows += [('DIRECTION',data['side']),('SCORE',f.get('score','—')),('PRICE',f.get('price','—')),('3M TIMING',f.get('3m timing','—')),('MOMENTUM',f.get('momentum','—')),('SPREAD',f.get('spread','—')),('PATTERN',f.get('pattern','—')),('TRIGGER',f.get('trigger','—'))]
-    else:rows += [('SCORE',f.get('score','—')),('PRICE',f.get('price','—')),('3M TIMING',f.get('3m timing','—')),('MOMENTUM',f.get('momentum','—')),('SPREAD',f.get('spread','—')),('PATTERN',f.get('pattern','—')),('TRIGGER',f.get('trigger','—')),('INVALIDATION',f.get('invalidation','—'))]
-    for label,value in rows:
-        d.text((lx,y),label,font=lf,fill=muted); d.line((235,y-2,235,y+31),fill=(28,116,153),width=2); low=str(value).lower(); color=cyan if label=='STYLE' else white
-        if label in ('DIRECTION','MOMENTUM','3M TIMING'):color=green if ('call' in low or 'bull' in low) else red if ('put' in low or 'bear' in low) else white
-        if early and label=='SCORE':color=green
-        if early and label=='TRIGGER':color=amber
-        font=bb if label in ('STYLE','DIRECTION','SCORE','MOMENTUM') else bf
-        for j,t in enumerate(_fit(d,value,font,W-vx-80,1)):d.text((vx,y-2+j*30),t,font=font,fill=color)
-        y+=rh
-    sy=y+4; d.line((45,sy,W-45,sy),fill=(21,92,119),width=2); y=sy+30
-    details=[('CONFIRMATION',f.get('confirmation','—')),('WHY ON WATCH',f.get('why','—'))] if early else [('CONFIRMATION',f.get('confirmation','—')),('NEWS',f.get('news','—')),('WHY',f.get('why','—'))]
-    for label,value in details:
-        d.text((lx,y),label,font=lf,fill=muted); d.line((235,y-2,235,y+31),fill=(28,116,153),width=2); font=bb if label=='CONFIRMATION' else sf; color=accent if label=='CONFIRMATION' else white; wrapped=_fit(d,value,font,W-vx-65,2)
-        for j,t in enumerate(wrapped):d.text((vx,y-1+j*29),t,font=font,fill=color)
-        y+=72 if len(wrapped)>1 else 55
-    opts=data.get('options') or []
-    if opts and y<H-170:
-        d.line((45,y+4,W-45,y+4),fill=(21,92,119),width=1); y+=22; d.text((lx,y),'RECOMMENDED OPTIONS',font=lf,fill=cyan); ot='  '.join(x.replace('🎯','').strip() for x in opts[1:4])
-        for j,t in enumerate(_fit(d,ot,sf,W-vx-65,2)):d.text((vx,y-1+j*28),t,font=sf,fill=white)
-    ft=H-112; ff=(54,42,5) if early or status=='WATCH' else (4,48,54); d.rounded_rectangle((28,ft,W-28,H-28),radius=18,fill=ff,outline=accent,width=2); d.text((58,ft+25),'STATUS',font=lf,fill=cyan); d.line((185,ft+16,185,ft+62),fill=(28,116,153),width=2)
-    footer='⚠  EARLY SETUP — NOT A CONFIRMED ENTRY' if early else '✓  CONFIRMED — PRICE ACTION VALIDATED' if status=='CONFIRMED' else '⌛  WATCH — WAITING FOR PRICE-ACTION CONFIRMATION'; d.text((225,ft+19),footer,font=_font(29,True),fill=accent)
+    # CHIEF Alert Card V2 — matches the approved compact dashboard layout.
+    W,H=1536,961
+    img=Image.new('RGB',(W,H),(2,15,28)); d=ImageDraw.Draw(img)
+    cyan=(48,220,248); white=(242,246,251); muted=(157,190,219)
+    green=(63,240,171); red=(255,91,111); amber=(255,197,70)
+    navy=(3,27,47); panel=(4,31,53); line=(11,91,124)
+    early=data['early']; status=data['status']; side=data['side']; f=data['fields']
+    accent=amber if early or status=='WATCH' else green
+    side_color=green if side=='CALL' else red if side=='PUT' else amber
+
+    def box(x1,y1,x2,y2,outline=cyan,fill=panel,r=14,w=2):
+        d.rounded_rectangle((x1,y1,x2,y2),radius=r,fill=fill,outline=outline,width=w)
+    def txt(x,y,t,size=24,bold=False,color=white):
+        d.text((x,y),str(t),font=_font(size,bold),fill=color)
+    def one_line(text,font,maxw):
+        return _fit(d,text,font,maxw,1)[0]
+
+    # Header
+    box(14,8,1522,136,outline=line,fill=navy)
+    txt(38,20,'CHIEF',54,True,cyan); txt(40,78,'SIGNAL ALERT',22,True,white); txt(40,108,'DISCIPLINE · DATA · EXECUTION',14,False,muted)
+    d.line((344,22,344,119),fill=cyan,width=2)
+    txt(382,24,data['ticker'],54,True,white)
+    title='EARLY SETUP' if early else f'CONFIRMED {side}' if status=='CONFIRMED' else f'WATCH {side}'
+    txt(768,43,title,44,True,side_color if not early else amber)
+    badge=data['trade_type']; box(1265,36,1505,103,outline=cyan,fill=(3,45,66)); txt(1292,53,badge,28,True,cyan)
+
+    # Metric boxes
+    metrics=[('PRICE',f.get('price','—')),('SETUP SCORE',f.get('score','—')),('TRIGGER',f.get('trigger','—')),('INVALIDATION',f.get('invalidation','—'))]
+    xs=[14,398,776,1150]
+    for i,(lab,val) in enumerate(metrics):
+        box(xs[i],144,xs[i]+370,276,outline=line)
+        txt(xs[i]+95,171,lab,20,True,muted)
+        txt(xs[i]+95,205,one_line(val,_font(48,True),250),48,True,white)
+
+    # Technical + momentum
+    box(14,287,760,552,outline=line); box(775,287,1521,552,outline=line)
+    txt(91,304,'TECHNICAL SETUP',29,True,cyan); txt(850,304,'MOMENTUM',29,True,cyan)
+    tech=[('PATTERN',f.get('pattern','—')),('3M TIMING',f.get('3m timing','—')),('EMA8 / VWAP',f.get('3m timing','—')),('SPREAD',f.get('spread','—'))]
+    mom_text=f.get('momentum','—')
+    rsi=re.search(r'RSI\s*([+-]?[\d.]+)',mom_text,re.I); roc=re.search(r'(?:5-bar\s*)?ROC\s*([+-]?[\d.]+%?)',mom_text,re.I); macd=re.search(r'MACD(?:\s*hist)?\s*([+-]?[\d.]+)',mom_text,re.I); rv=re.search(r'RVOL\s*([\d.]+x?)',mom_text,re.I)
+    moms=[('RSI',rsi.group(1) if rsi else '—'),('5-BAR ROC',roc.group(1) if roc else '—'),('MACD HIST',macd.group(1) if macd else '—'),('RVOL',rv.group(1) if rv else '—')]
+    for j,(lab,val) in enumerate(tech):
+        yy=354+j*48; txt(58,yy,lab,19,True,muted); txt(279,yy,one_line(val,_font(22,lab=='3M TIMING'),445),22,lab=='3M TIMING',side_color if lab=='3M TIMING' else white); d.line((36,yy+37,742,yy+37),fill=line,width=1)
+    for j,(lab,val) in enumerate(moms):
+        yy=354+j*48; txt(819,yy,lab,19,True,muted); col=side_color if lab in ('5-BAR ROC','RVOL') else white; txt(1035,yy,val,22,True if lab=='RVOL' else False,col); d.line((797,yy+37,1501,yy+37),fill=line,width=1)
+    bias='BULLISH' if side=='CALL' else 'BEARISH' if side=='PUT' else 'WATCH'; box(1320,300,1501,340,outline=side_color,fill=(25,27,42)); txt(1360,309,bias,20,True,side_color)
+
+    # Confirmation bar
+    box(14,565,1521,654,outline=accent,fill=(2,52,48) if status=='CONFIRMED' else (55,42,5))
+    headline='PRICE ACTION CONFIRMED' if status=='CONFIRMED' else 'EARLY SETUP — WAITING FOR CONFIRMATION'
+    txt(121,585,headline,34,True,accent)
+    conf=f.get('confirmation','')
+    checks=['Score ≥ 8.0','Directional candle','Trigger / BOS','Breakout hold']
+    for i,c in enumerate(checks): txt(620+i*180,598,'✓ '+c,15,True,green if status=='CONFIRMED' else amber)
+
+    # Why
+    box(14,664,1521,733,outline=line); txt(95,682,'WHY THIS SETUP',23,True,cyan)
+    txt(375,688,one_line(f.get('why','—'),_font(18),1090),18,False,white)
+
+    # News
+    box(14,744,1521,843,outline=line); txt(95,767,'NEWS',23,True,cyan)
+    news=f.get('news','—'); tone='POSITIVE HEADLINE TONE' if 'positive' in news.lower() else 'NEGATIVE HEADLINE TONE' if 'negative' in news.lower() else 'NEWS CONTEXT'
+    box(224,757,468,791,outline=green if 'POSITIVE' in tone else red if 'NEGATIVE' in tone else cyan,fill=(3,49,50)); txt(244,765,tone,15,True,green if 'POSITIVE' in tone else red if 'NEGATIVE' in tone else cyan)
+    txt(224,800,one_line(news,_font(19,True),1230),19,True,white)
+
+    # Footer
+    box(14,855,1521,936,outline=accent,fill=(2,55,48) if status=='CONFIRMED' else (55,42,5))
+    footer='CONFIRMED — PRICE ACTION VALIDATED' if status=='CONFIRMED' else 'EARLY SETUP — NOT A CONFIRMED ENTRY'
+    txt(121,878,footer,31,True,accent); txt(1204,887,'CHIEF TRADING INTELLIGENCE',14,False,muted)
     out=io.BytesIO(); img.save(out,format='PNG',optimize=True); out.seek(0); return out
 
 
