@@ -107,6 +107,42 @@ def send_one_time_swing_test():
         print(f'One-time Discord Swing test failed: {e}',flush=True)
 
 
+def deployment_health_report():
+    """Report the exact code version running on the VPS to Discord after each deploy/restart."""
+    import subprocess
+    try:
+        commit=subprocess.check_output(['git','rev-parse','--short=12','HEAD'],stderr=subprocess.STDOUT,text=True,timeout=5).strip()
+    except Exception as e:
+        commit=f'unknown ({type(e).__name__})'
+    try:
+        branch=subprocess.check_output(['git','rev-parse','--abbrev-ref','HEAD'],stderr=subprocess.STDOUT,text=True,timeout=5).strip()
+    except Exception:
+        branch='unknown'
+    now=datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %I:%M:%S %p ET')
+    features=[
+        '25s scan loop',
+        f'Day pool up to {DAY_CANDIDATES}',
+        f'Swing pool up to {SWING_CANDIDATES}',
+        'Daily + derived 4H + Weekly swing structure',
+        'JR Swing PRO + FiFi TQE playbook',
+        'VCP / Stage / Gap rule / U&R / Anticipation / Rubber Band',
+    ]
+    msg=(
+        '🟢 CHIEF VPS DEPLOYMENT HEALTH\n'
+        f'Running commit: {commit}\n'
+        f'Branch: {branch}\n'
+        f'Started: {now}\n'
+        f'Moomoo: {os.getenv("MOOMOO_HOST","127.0.0.1")}:{os.getenv("MOOMOO_PORT","11111")}\n'
+        f'Features: {" | ".join(features)}\n'
+        'Status: BOT PROCESS STARTED — beginning market/data checks'
+    )
+    try:
+        discord(msg)
+        print(f'CHIEF deployment health sent: {commit}',flush=True)
+    except Exception as e:
+        print(f'CHIEF deployment health Discord failed: {e}',flush=True)
+
+
 def ema(s,n): return s.ewm(span=n, adjust=False).mean()
 
 
@@ -353,6 +389,7 @@ def run():
     last_alert={}; swing_send_count={}
     day_candidates=[]; swing_candidates=[]; swing_cursor=0; last_refresh=0.0
     print(f'Chief Bot started. Split scanner active: up to {DAY_CANDIDATES} fast DAY names every {SCAN_SECONDS}s + up to {SWING_CANDIDATES} rotating JR Swing PRO names in batches of {SWING_BATCH_SIZE}. 1m disabled.',flush=True)
+    deployment_health_report()
     send_one_time_swing_test()
     try:
         while True:
